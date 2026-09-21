@@ -2969,6 +2969,7 @@ void DrawEntryMarker(ENUM_ORDER_TYPE ot,double price,datetime time,int setupId)
 //     invoked from OnTick() behind the existing DebugMode switch.
 //=========================================================================
 #define PN_PREFIX "V13_P_"
+#define PN_RPAD    14          // guaranteed right-side padding (px)
 
 // ---- forward declarations (MQL5 requires declaration before use) ----
 double PnCharW();
@@ -2996,6 +2997,11 @@ int  g_PnZ1W=0, g_PnZ2W=0, g_PnZ3W=0, g_PnZ4W=0; // field widths in CHARACTERS
 int  g_PnRZ1=0, g_PnRZ2=0;                     // right col label/value origins
 int  g_PnRZ1W=0, g_PnRZ2W=0;
 int  g_PnLeftCols=0, g_PnRightCols=0;          // section-rule widths (chars)
+// HARD RIGHT BOUNDARY - no panel text may ever render past this x.
+int  g_PnRightEdge=0;                          // absolute px, = X+W-PN_RPAD
+// RECENT TRADES: four independent column origins (absolute px) + budgets.
+int  g_PnTrXTime=0, g_PnTrXType=0, g_PnTrXRes=0, g_PnTrXPL=0;
+int  g_PnTrWTime=0, g_PnTrWType=0, g_PnTrWRes=0, g_PnTrWPL=0;
 int  g_PnBodyTop=0, g_PnFooterY=0;
 
 // ---- Dashboard colour scheme (dark navy HUD) ----
@@ -3238,6 +3244,46 @@ void PnSlotR(string role,int row,int x,string text,color clr)
    if(row+1>g_PnRightUsed) g_PnRightUsed=row+1;
 }
 
+// Blank every semantic slot that can live on a LEFT row.
+void PnLeftBlankRow(int row)
+{
+   string sr=IntegerToString(row);
+   PnHideExisting("LS_"+sr);
+   PnHideExisting("L1_"+sr); PnHideExisting("V1_"+sr);
+   PnHideExisting("L2_"+sr); PnHideExisting("V2_"+sr);
+}
+
+// Blank every semantic slot that can live on a RIGHT row, including the
+// recent-trade sub-columns and the daily-profit value. A spacer row MUST
+// use this instead of a bare rr++ or a stale title survives on that row.
+void PnRightBlankRow(int row)
+{
+   string sr=IntegerToString(row);
+   PnHideExisting("RS_"+sr);
+   PnHideExisting("RL_"+sr);
+   PnHideExisting("RV_"+sr);
+   PnHideExisting("RT_TIME_"+sr);
+   PnHideExisting("RT_TYPE_"+sr);
+   PnHideExisting("RT_RES_"+sr);
+   PnHideExisting("RT_PL_"+sr);
+   PnHideExisting("RD_"+sr);
+}
+
+// Blank every right-row slot EXCEPT the named role (used when a row holds
+// a single spanning message such as "No closed trades yet").
+void PnRightBlankRowExcept(int row,string keep)
+{
+   string sr=IntegerToString(row);
+   if(keep!="RS")      PnHideExisting("RS_"+sr);
+   if(keep!="RL")      PnHideExisting("RL_"+sr);
+   if(keep!="RV")      PnHideExisting("RV_"+sr);
+   if(keep!="RT_TIME") PnHideExisting("RT_TIME_"+sr);
+   if(keep!="RT_TYPE") PnHideExisting("RT_TYPE_"+sr);
+   if(keep!="RT_RES")  PnHideExisting("RT_RES_"+sr);
+   if(keep!="RT_PL")   PnHideExisting("RT_PL_"+sr);
+   if(keep!="RD")      PnHideExisting("RD_"+sr);
+}
+
 // Blank an ALREADY EXISTING slot. Never creates an object, so this can
 // never leave MT5's default "Label" placeholder behind.
 void PnHideExisting(string id)
@@ -3257,7 +3303,11 @@ void PnLeftSection(int row,string title)
 void PnRightSection(int row,string title)
 {
    PnSlotR("RS",row,0,PnSectionText(title,g_PnRightCols),clrPnSection);
-   PnHideExisting("RL_"+IntegerToString(row)); PnHideExisting("RV_"+IntegerToString(row));
+   string sr=IntegerToString(row);
+   PnHideExisting("RL_"+sr);      PnHideExisting("RV_"+sr);
+   PnHideExisting("RT_TIME_"+sr); PnHideExisting("RT_TYPE_"+sr);
+   PnHideExisting("RT_RES_"+sr);  PnHideExisting("RT_PL_"+sr);
+   PnHideExisting("RD_"+sr);
 }
 
 //-------------------------------------------------------------------------
@@ -3295,8 +3345,14 @@ void PnLeftKV2(int row,string l1,string v1,color c1,string l2,string v2,color c2
 void PnRightKV(int row,string label,string value,color vClr)
 {
    PnSlotR("RL",row,g_PnRZ1,PnFit(label,g_PnRZ1W),clrPnLabel);
-   PnSlotR("RV",row,g_PnRZ2,PnFit(value,g_PnRZ2W),vClr);
+   // budget re-measured against the HARD right edge every frame
+   int maxChars=(int)MathFloor((double)(g_PnRightEdge-(g_PnRightX+g_PnRZ2))/PnCharW());
+   PnSlotR("RV",row,g_PnRZ2,PnFit(value,MathMin(g_PnRZ2W,maxChars)),vClr);
    PnHideExisting("RS_"+IntegerToString(row));
+   PnHideExisting("RT_TIME_"+IntegerToString(row));
+   PnHideExisting("RT_TYPE_"+IntegerToString(row));
+   PnHideExisting("RT_RES_" +IntegerToString(row));
+   PnHideExisting("RT_PL_"  +IntegerToString(row));
 }
 
 // Monospace advance width (px per character) for the configured font size.
@@ -3319,22 +3375,13 @@ int PnTextW(int chars)
 //-------------------------------------------------------------------------
 void PnHideSurplus()
 {
+   // Blanks EVERY slot type that any previous frame could have created on
+   // that row - section title, label/value pair, the four recent-trade
+   // sub-columns and the daily-profit value.
    for(int r=g_PnLeftUsed;r<g_PnLeftPrev && r<PN_MAX_ROWS;r++)
-   {
-      string sr=IntegerToString(r);
-      PnHideExisting("LS_"+sr);
-      PnHideExisting("L1_"+sr); PnHideExisting("V1_"+sr);
-      PnHideExisting("L2_"+sr); PnHideExisting("V2_"+sr);
-   }
+      PnLeftBlankRow(r);
    for(int r=g_PnRightUsed;r<g_PnRightPrev && r<PN_MAX_ROWS;r++)
-   {
-      string sr=IntegerToString(r);
-      PnHideExisting("RS_"+sr);
-      PnHideExisting("RL_"+sr); PnHideExisting("RV_"+sr);
-   }
-   // Variable-length recent-trade list (indexed by trade, not by row).
-   for(int t=g_PnTrCount;t<PN_TRADES;t++)
-      PnHideExisting("RT_"+IntegerToString(t));
+      PnRightBlankRow(r);
 
    g_PnLeftPrev =g_PnLeftUsed;
    g_PnRightPrev=g_PnRightUsed;
@@ -3673,14 +3720,34 @@ void RefreshPanel()
    g_PnZ3W=g_PnZ1W;
    g_PnZ4W=(int)MathMax(6,MathFloor((double)(usable-g_PnZ4-4)/cw));
 
-   int rColChars=(int)MathFloor((double)(g_PnColW-pad)/PnCharW());
-   if(rColChars<34) rColChars=34;
-   g_PnRightCols=rColChars;
-   int rLabelPx=(int)MathRound((g_PnColW-pad)*0.46);
+   //---------------------------------------------------------------------
+   //  RIGHT COLUMN - bounded by a HARD pixel edge, not by a character
+   //  guess. Everything on the right is measured backwards from
+   //  g_PnRightEdge so no value can ever cross the cyan border.
+   //---------------------------------------------------------------------
+   g_PnRightEdge = g_PnX + g_PnW - PN_RPAD;          // absolute px
+   int rUsable   = g_PnRightEdge - g_PnRightX;       // real drawable width
+   if(rUsable<80) rUsable=80;
+
+   g_PnRightCols=(int)MathMax(20,MathFloor((double)rUsable/cw));
+
+   int rLabelPx=(int)MathRound(rUsable*0.44);
    g_PnRZ1=0;
    g_PnRZ2=rLabelPx+labelValueGap;
-   g_PnRZ1W=(int)MathMax(8,MathFloor((rLabelPx-labelValueGap)/cw));
-   g_PnRZ2W=(int)MathMax(8,MathFloor((double)(g_PnColW-pad-g_PnRZ2-4)/cw));
+   g_PnRZ1W=(int)MathMax(8,MathFloor((double)(rLabelPx-labelValueGap)/cw));
+   // value budget measured to the hard edge
+   g_PnRZ2W=(int)MathMax(6,MathFloor((double)(rUsable-g_PnRZ2)/cw));
+
+   //---- RECENT TRADES: four independent, non-overlapping columns -------
+   int colGap=10;
+   g_PnTrWTime=11;                                   // "03/09 15:42"
+   g_PnTrWType=4;                                    // "Sell"
+   g_PnTrWRes =4;                                    // "LOSS"
+   g_PnTrXTime=g_PnRightX;
+   g_PnTrXType=g_PnTrXTime+PnTextW(g_PnTrWTime)+colGap;
+   g_PnTrXRes =g_PnTrXType+PnTextW(g_PnTrWType)+colGap;
+   g_PnTrXPL  =g_PnTrXRes +PnTextW(g_PnTrWRes )+colGap;
+   g_PnTrWPL  =(int)MathMax(5,MathFloor((double)(g_PnRightEdge-g_PnTrXPL)/cw));
 
    int headerH=g_PnRowH+12;
    g_PnBodyTop=g_PnY+headerH+6;
@@ -3722,19 +3789,43 @@ void RefreshPanel()
 
    // Three clearly separated header regions: name (left), symbol+TF
    // (centred), status lamp (right-aligned inside the pane).
-   int hdrY=g_PnY+6;
-   string hdrSym=_Symbol+"   "+PnTFName(_Period);
-   string hdrStat=stTxt+"  "+ShortToString(0x25CF);
+   //  Three independent header regions. The status is aligned from the
+   //  RIGHT EDGE inward with a guaranteed PN_RPAD gap, and is truncated if
+   //  a very long status would ever reach the centre block - so TRADING /
+   //  WAITING / BLOCKED / RECOVERING / EMERGENCY / DISABLED / ERROR all
+   //  sit safely inside the border.
    int hdrFont=g_PnFont+2;
    double hdrCharW=hdrFont*0.62+0.85;
-   int symX =g_PnX+(g_PnW-(int)MathRound(StringLen(hdrSym)*hdrCharW))/2;
-   int statX=g_PnX+g_PnW-12-(int)MathRound(StringLen(hdrStat)*hdrCharW);
+   // vertically centre the header text inside the header band
+   int hdrTextH=(int)MathRound(hdrFont*1.35);
+   int hdrY=g_PnY+(headerH-hdrTextH)/2;
+   if(hdrY<g_PnY+3) hdrY=g_PnY+3;
 
-   PnLabel("HdrName",g_PnLeftX,hdrY,
-           "XAUUSD_TrendContinuation_V13 | v13.4",clrPnTitle,hdrFont);
-   PnLabel("HdrSym",symX,hdrY,hdrSym,clrPnValue,hdrFont);
+   string hdrName="XAUUSD_TrendContinuation_V13 | v13.4";
+   string hdrSym =_Symbol+"   "+PnTFName(_Period);
+   string hdrStat=stTxt+"  "+ShortToString(0x25CF);
+
+   int statW=(int)MathRound(StringLen(hdrStat)*hdrCharW);
+   int statX=g_PnX+g_PnW-PN_RPAD-statW;
+   // never let the status run back into the centred symbol block
+   int nameEnd=g_PnLeftX+(int)MathRound(StringLen(hdrName)*hdrCharW);
+   if(statX<nameEnd+20)
+   {
+      int avail=(int)MathFloor((double)(g_PnX+g_PnW-PN_RPAD-(nameEnd+20))/hdrCharW);
+      hdrStat=PnFit(hdrStat,MathMax(4,avail));
+      statW=(int)MathRound(StringLen(hdrStat)*hdrCharW);
+      statX=g_PnX+g_PnW-PN_RPAD-statW;
+   }
+
+   int symX=g_PnX+(g_PnW-(int)MathRound(StringLen(hdrSym)*hdrCharW))/2;
+   if(symX<nameEnd+16) symX=nameEnd+16;
+   if(symX+(int)MathRound(StringLen(hdrSym)*hdrCharW)>statX-16)
+      symX=statX-16-(int)MathRound(StringLen(hdrSym)*hdrCharW);
+
+   PnLabel("HdrName",g_PnLeftX,hdrY,hdrName,clrPnTitle,hdrFont);
+   PnLabel("HdrSym", symX,    hdrY,hdrSym, clrPnValue,hdrFont);
    // Status lamp is a foreground label -> always above the opaque pane.
-   PnLabel("HdrStat",statX,hdrY,hdrStat,stClr,hdrFont);
+   PnLabel("HdrStat",statX,   hdrY,hdrStat,stClr,hdrFont);
 
    //=======================  LEFT COLUMN  ===============================
    int r=0;
@@ -3753,7 +3844,7 @@ void RefreshPanel()
    PnLeftKV2(r++,"Margin Level", (usedM>0?StringFormat("%.1f %%",mlevel):"--"),
                  (usedM>0 && mlevel<200 ? clrPnWarn : clrPnValue),
                  "Leverage",  StringFormat("1:%d",(int)lev), clrPnValue);
-   r++;
+   PnLeftBlankRow(r++);
 
    // ---- B. TRADE SAFETY ----
    PnLeftSection(r++,"TRADE SAFETY");
@@ -3775,7 +3866,7 @@ void RefreshPanel()
    PnLeftKV2(r++,"Daily Status", (g_HaltedDaily?"HALTED":"NORMAL"),
                  (g_HaltedDaily?clrPnBad:clrPnGood),"","",clrPnDim);
    PnLeftKV2(r++,"Trade Permit", permTxt, permClr, "","",clrPnDim);   // wide row
-   r++;
+   PnLeftBlankRow(r++);
 
    // ---- C. MULTI-TIMEFRAME BIAS ----
    PnLeftSection(r++,"MULTI-TIMEFRAME BIAS");
@@ -3804,7 +3895,7 @@ void RefreshPanel()
       PnLeftKV2(r++,"M1  Entry",      m1V, m1C,  "", "", clrPnDim);
       PnLeftKV2(r++,"Aligned Bias",   alV, alC,  "", "", clrPnDim);
    }
-   r++;
+   PnLeftBlankRow(r++);
 
    // ---- D. M30 SUPPORT/RESISTANCE FILTER ----
    PnLeftSection(r++,"M30 S/R FILTER");
@@ -3868,7 +3959,7 @@ void RefreshPanel()
       if(srBlocked && srWhy!="")
          PnLeftKV2(r++,"Block Reason",srWhy,clrPnBad,"","",clrPnDim);   // wide row
    }
-   r++;
+   PnLeftBlankRow(r++);
 
    // ---- E. OPEN TRADES ----
    PnLeftSection(r++,"OPEN TRADES");
@@ -3881,7 +3972,7 @@ void RefreshPanel()
                  "Avg Sell",(oAvgSell>0?DoubleToString(oAvgSell,_Digits):"--"),clrPnValue);
    PnLeftKV2(r++,"Floating P/L",StringFormat("%+.2f USD",oFloat),PnPLColor(oFloat),
                  "Target/Pos",StringFormat("+%.2f USD",g_ProfitTargetUSD),clrPnGood);
-   r++;
+   PnLeftBlankRow(r++);
 
    // ---- F. SETUP STATUS ----
    PnLeftSection(r++,"SETUP STATUS");
@@ -3956,7 +4047,7 @@ void RefreshPanel()
             PnLeftKV2(r++,"Block Reason",s.blockReason,clrPnBad,"","",clrPnDim);
       }
    }
-   r++;
+   PnLeftBlankRow(r++);
 
    // ---- H. TODAY'S REPORT ----
    PnLeftSection(r++,"TODAY'S REPORT");
@@ -4024,7 +4115,7 @@ void RefreshPanel()
       PnRightKV(rr++,"Close All",(CloseAllOnEmergencyLoss?"ENABLED":"DISABLED"),
                 (CloseAllOnEmergencyLoss?clrPnGood:clrPnWarn));
    }
-   rr++;
+   PnRightBlankRow(rr++);
 
    // ---- B. DAILY PROFIT HISTORY ----
    PnRightSection(rr++,"DAILY PROFIT");
@@ -4050,35 +4141,35 @@ void RefreshPanel()
             vTxt=PnPadLeft(StringFormat("%+.2f USD%s",v,pctTxt),g_PnRZ2W);
             vClr=PnPLColor(v);
          }
-         PnLabel("RD_"+IntegerToString(d),g_PnRightX+g_PnRZ2,PnRowY(rr),vTxt,vClr,g_PnFont);
+         int dMax=(int)MathFloor((double)(g_PnRightEdge-(g_PnRightX+g_PnRZ2))/PnCharW());
+         PnSlotR("RD",rr,g_PnRZ2,PnFit(vTxt,dMax),vClr);
+         PnHideExisting("RV_"+IntegerToString(rr));
          rr++;
       }
    }
-   rr++;
+   PnRightBlankRow(rr++);
 
    // ---- C. RECENT TRADES ----
+   //  FOUR independent, individually positioned labels per row. Nothing is
+   //  concatenated into a padded string any more, so "SellWIN" /
+   //  "TypeResult" collisions are structurally impossible. The P/L column
+   //  is right-aligned against the hard right edge.
    PnRightSection(rr++,"RECENT TRADES");
    {
-      // Sub-column budgets derived from the right column width.
-      int wTime=13, wType=6;
-      int wRest=g_PnRightCols-wTime-wType;
-      if(wRest<14) wRest=14;
-      int wRes=7, wPL=wRest-wRes;
-      if(wPL<7) wPL=7;
-      int xRest=PnTextW(wTime+wType);
-
-      PnSlotR("RL",rr,g_PnRZ1,PnPad("Time",wTime)+PnPad("Type",wType),clrPnDim);
-      PnLabel("RTH",g_PnRightX+xRest,PnRowY(rr),
-              PnPad("Result",wRes)+PnPadLeft("P/L",wPL),clrPnDim,g_PnFont);
+      // header - one label per column, same origins as the data rows
+      PnSlotR("RL",rr,g_PnTrXTime-g_PnRightX,"Time",clrPnDim);
+      PnSlotR("RT_TYPE",rr,g_PnTrXType-g_PnRightX,"Type",clrPnDim);
+      PnSlotR("RT_RES", rr,g_PnTrXRes -g_PnRightX,"Res",clrPnDim);
+      PnSlotR("RT_PL",  rr,g_PnTrXPL  -g_PnRightX,PnPadLeft("P/L",g_PnTrWPL),clrPnDim);
       PnHideExisting("RS_"+IntegerToString(rr));
       PnHideExisting("RV_"+IntegerToString(rr));
+      PnHideExisting("RD_"+IntegerToString(rr));
       rr++;
 
       if(g_PnTrCount<=0)
       {
-         PnSlotR("RL",rr,g_PnRZ1,"  No closed trades yet",clrPnDim);
-         PnHideExisting("RS_"+IntegerToString(rr));
-         PnHideExisting("RV_"+IntegerToString(rr));
+         PnSlotR("RL",rr,g_PnRZ1,"No closed trades yet",clrPnDim);
+         PnRightBlankRowExcept(rr,"RL");
          rr++;
       }
       else
@@ -4086,18 +4177,23 @@ void RefreshPanel()
          for(int t=0;t<g_PnTrCount;t++)
          {
             bool win=(g_PnTrPL[t]>=0);
-            PnSlotR("RL",rr,g_PnRZ1,
-                    PnPad(g_PnTrTime[t],wTime)+PnPad(g_PnTrType[t],wType),clrPnValue);
+            PnSlotR("RL",     rr,g_PnTrXTime-g_PnRightX,
+                    PnFit(g_PnTrTime[t],g_PnTrWTime),clrPnValue);
+            PnSlotR("RT_TYPE",rr,g_PnTrXType-g_PnRightX,
+                    PnFit(g_PnTrType[t],g_PnTrWType),clrPnValue);
+            PnSlotR("RT_RES", rr,g_PnTrXRes -g_PnRightX,
+                    (win?"WIN":"LOSS"),(win?clrPnGood:clrPnBad));
+            PnSlotR("RT_PL",  rr,g_PnTrXPL  -g_PnRightX,
+                    PnPadLeft(PnFit(StringFormat("%+.2f",g_PnTrPL[t]),g_PnTrWPL),g_PnTrWPL),
+                    (win?clrPnGood:clrPnBad));
             PnHideExisting("RS_"+IntegerToString(rr));
             PnHideExisting("RV_"+IntegerToString(rr));
-            PnLabel("RT_"+IntegerToString(t),g_PnRightX+xRest,PnRowY(rr),
-                    PnPad(win?"WIN":"LOSS",wRes)+PnPadLeft(StringFormat("%+.2f",g_PnTrPL[t]),wPL),
-                    (win?clrPnGood:clrPnBad),g_PnFont);
+            PnHideExisting("RD_"+IntegerToString(rr));
             rr++;
          }
       }
    }
-   rr++;
+   PnRightBlankRow(rr++);
 
    // ---- RIGHT D. SYSTEM STATS (moved here to balance the two columns) ----
    //      Uses ONLY the existing g_Cnt_* / g_Sum* counters - no invented data.
@@ -4202,12 +4298,13 @@ void RefreshPanel()
       string f5="|  "+conn;
 
       int fx=g_PnLeftX;
+      // (each segment below is additionally clamped to g_PnRightEdge)
       PnLabel("Ft1",fx,fy,f1,clrPnValue,g_PnFont); fx+=PnTextW(StringLen(f1)+3);
       PnLabel("Ft2",fx,fy,f2,clrPnWarn, g_PnFont); fx+=PnTextW(StringLen(f2)+3);
       PnLabel("Ft3",fx,fy,f3,clrPnValue,g_PnFont); fx+=PnTextW(StringLen(f3)+3);
       PnLabel("Ft4",fx,fy,f4,clrPnLabel,g_PnFont); fx+=PnTextW(StringLen(f4)+3);
       // Last segment is clamped so it always stays inside the pane.
-      int f5x=MathMin(fx,g_PnX+g_PnW-12-PnTextW(StringLen(f5)));
+      int f5x=MathMin(fx,g_PnRightEdge-PnTextW(StringLen(f5)));
       PnLabel("Ft5",f5x,fy,f5,connClr,g_PnFont);
    }
 
