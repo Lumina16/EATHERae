@@ -2516,6 +2516,12 @@ int OnInit()
    // ---- dashboard: install the refresh timer (live only; the tester has
    //      no real time base, so it falls back to GetTickCount throttling
    //      driven from OnTick - see PanelTick()). ----
+   // ONE-TIME cleanup of any orphaned panel objects left behind by an
+   // earlier renderer generation (older builds encoded pixel offsets into
+   // object names, e.g. "L12_173"). Runs ONLY here in OnInit - never on a
+   // refresh - and touches nothing outside PN_PREFIX.
+   ClearPanelObjects();
+
    g_PanelVisible=false;
    g_PanelDirty=true;
    g_PanelLastDrawMs=GetTickCount();
@@ -2969,8 +2975,10 @@ double PnCharW();
 int    PnTextW(int chars);
 void   PnLabel(string id,int x,int y,string text,color clr,int fontSize,string font="Consolas");
 void   PnRect(string id,int x,int y,int w,int h,color border,color bg,int zorder,bool back);
-void   PnLeftRaw(int row,int xOffset,string text,color clr);
-void   PnRightRaw(int row,int xOffset,string text,color clr);
+void   PnSlotL(string role,int row,int x,string text,color clr);
+void   PnSlotR(string role,int row,int x,string text,color clr);
+void   PnHideExisting(string id);
+string PnFit(string s,int maxChars);
 void   DetermineStatus(string &status,color &clr);
 int    LatestSetupIndex();
 void   PnRebuildHistory();
@@ -3058,6 +3066,16 @@ color PnPLColor(double v)
    if(v>0) return clrPnGood;
    if(v<0) return clrPnBad;
    return clrPnValue;
+}
+
+// Truncate-only fit. Never pads: each field is its own positioned
+// OBJ_LABEL, so trailing spaces serve no purpose and only crowd neighbours.
+string PnFit(string s,int maxChars)
+{
+   if(maxChars<=0) return "";
+   if(StringLen(s)<=maxChars) return s;
+   if(maxChars<=3) return StringSubstr(s,0,maxChars);
+   return StringSubstr(s,0,maxChars-3)+"...";
 }
 
 // Right-align a string inside a fixed character width (numeric columns).
@@ -3192,25 +3210,55 @@ void PnEnsureChrome()
 //-------------------------------------------------------------------------
 int PnRowY(int row) { return g_PnBodyTop + row*g_PnRowH; }
 
-void PnLeftRaw(int row,int xOffset,string text,color clr)
+//-------------------------------------------------------------------------
+//  STABLE SEMANTIC SLOTS.
+//
+//  Object identity NEVER encodes a pixel offset. A slot is addressed by
+//  (role, row) only, so changing PanelWidth / PanelFontSize / PanelRowHeight
+//  / PanelX / PanelY merely MOVES existing objects instead of spawning a
+//  second generation of orphaned labels.
+//
+//     LS_<row>  left  section rule        RS_<row>  right section rule
+//     L1_<row>  left  label  1            RL_<row>  right label
+//     V1_<row>  left  value  1            RV_<row>  right value
+//     L2_<row>  left  label  2            RD_<i>    daily-profit value
+//     V2_<row>  left  value  2            RT_<i>    recent-trade value
+//-------------------------------------------------------------------------
+void PnSlotL(string role,int row,int x,string text,color clr)
 {
    if(row<0 || row>=PN_MAX_ROWS) return;
-   PnLabel("L"+IntegerToString(row)+"_"+IntegerToString(xOffset),
-           g_PnLeftX+xOffset,PnRowY(row),text,clr,g_PnFont);
+   PnLabel(role+"_"+IntegerToString(row),g_PnLeftX+x,PnRowY(row),text,clr,g_PnFont);
    if(row+1>g_PnLeftUsed) g_PnLeftUsed=row+1;
 }
 
-void PnRightRaw(int row,int xOffset,string text,color clr)
+void PnSlotR(string role,int row,int x,string text,color clr)
 {
    if(row<0 || row>=PN_MAX_ROWS) return;
-   PnLabel("R"+IntegerToString(row)+"_"+IntegerToString(xOffset),
-           g_PnRightX+xOffset,PnRowY(row),text,clr,g_PnFont);
+   PnLabel(role+"_"+IntegerToString(row),g_PnRightX+x,PnRowY(row),text,clr,g_PnFont);
    if(row+1>g_PnRightUsed) g_PnRightUsed=row+1;
 }
 
+// Blank an ALREADY EXISTING slot. Never creates an object, so this can
+// never leave MT5's default "Label" placeholder behind.
+void PnHideExisting(string id)
+{
+   string name=PN_PREFIX+id;
+   if(ObjectFind(0,name)>=0)
+      ObjectSetString(0,name,OBJPROP_TEXT," ");
+}
+
 // Section header row
-void PnLeftSection(int row,string title)  { PnLeftRaw(row,0,PnSectionText(title,g_PnLeftCols),clrPnSection); }
-void PnRightSection(int row,string title) { PnRightRaw(row,0,PnSectionText(title,g_PnRightCols),clrPnSection); }
+void PnLeftSection(int row,string title)
+{
+   PnSlotL("LS",row,0,PnSectionText(title,g_PnLeftCols),clrPnSection);
+   PnHideExisting("L1_"+IntegerToString(row)); PnHideExisting("V1_"+IntegerToString(row));
+   PnHideExisting("L2_"+IntegerToString(row)); PnHideExisting("V2_"+IntegerToString(row));
+}
+void PnRightSection(int row,string title)
+{
+   PnSlotR("RS",row,0,PnSectionText(title,g_PnRightCols),clrPnSection);
+   PnHideExisting("RL_"+IntegerToString(row)); PnHideExisting("RV_"+IntegerToString(row));
+}
 
 //-------------------------------------------------------------------------
 //  FOUR-ZONE LEFT ROW:   [label1][value1]   [label2][value2]
@@ -3224,32 +3272,31 @@ void PnRightSection(int row,string title) { PnRightRaw(row,0,PnSectionText(title
 //-------------------------------------------------------------------------
 void PnLeftKV2(int row,string l1,string v1,color c1,string l2,string v2,color c2)
 {
-   PnLeftRaw(row,0,PnPad(l1,g_PnZ1W),clrPnLabel);
+   PnSlotL("L1",row,g_PnZ1,PnFit(l1,g_PnZ1W),clrPnLabel);
 
    if(l2!="")
    {
-      PnLabel("LA"+IntegerToString(row),g_PnLeftX+g_PnZ2,PnRowY(row),
-              PnPad(v1,g_PnZ2W),c1,g_PnFont);
-      PnLeftRaw(row,g_PnZ3,PnPad(l2,g_PnZ3W),clrPnLabel);
-      PnLabel("LB"+IntegerToString(row),g_PnLeftX+g_PnZ4,PnRowY(row),
-              PnPad(v2,g_PnZ4W),c2,g_PnFont);
+      PnSlotL("V1",row,g_PnZ2,PnFit(v1,g_PnZ2W),c1);
+      PnSlotL("L2",row,g_PnZ3,PnFit(l2,g_PnZ3W),clrPnLabel);
+      PnSlotL("V2",row,g_PnZ4,PnFit(v2,g_PnZ4W),c2);
    }
    else
    {
-      // wide value: zones 2+3+4 merged
-      PnLabel("LA"+IntegerToString(row),g_PnLeftX+g_PnZ2,PnRowY(row),
-              PnPad(v1,g_PnZ2W+g_PnZ3W+g_PnZ4W),c1,g_PnFont);
-      PnLeftRaw(row,g_PnZ3,"",clrPnLabel);
-      PnLabel("LB"+IntegerToString(row),g_PnLeftX+g_PnZ4,PnRowY(row),"",clrPnLabel,g_PnFont);
+      // FULL-WIDTH ROW: value 1 spans zones 2..4; the second pair's slots
+      // are blanked IN PLACE (never re-created) so no "Label" can appear.
+      PnSlotL("V1",row,g_PnZ2,PnFit(v1,g_PnZ2W+g_PnZ3W+g_PnZ4W),c1);
+      PnHideExisting("L2_"+IntegerToString(row));
+      PnHideExisting("V2_"+IntegerToString(row));
    }
+   PnHideExisting("LS_"+IntegerToString(row));   // this row is not a section
 }
 
 //  RIGHT ROW: [label][value]  - same computed-zone principle.
 void PnRightKV(int row,string label,string value,color vClr)
 {
-   PnRightRaw(row,0,PnPad(label,g_PnRZ1W),clrPnLabel);
-   PnLabel("RV"+IntegerToString(row),g_PnRightX+g_PnRZ2,PnRowY(row),
-           PnPad(value,g_PnRZ2W),vClr,g_PnFont);
+   PnSlotR("RL",row,g_PnRZ1,PnFit(label,g_PnRZ1W),clrPnLabel);
+   PnSlotR("RV",row,g_PnRZ2,PnFit(value,g_PnRZ2W),vClr);
+   PnHideExisting("RS_"+IntegerToString(row));
 }
 
 // Monospace advance width (px per character) for the configured font size.
@@ -3264,48 +3311,30 @@ int PnTextW(int chars)
    return (int)MathRound(chars*PnCharW());
 }
 
-// Hide (blank) any pooled row that the current frame no longer uses.
 //-------------------------------------------------------------------------
-//  Blank ONLY the rows that a previous, longer frame used and that the
-//  current frame does not. The loops start at the CURRENT used-count, so
-//  an active row can never be blanked.
-//
-//  Object-name map (all unique, all prefixed with PN_PREFIX):
-//     "L<row>_0"        left column, first field   (label / section title)
-//     "L<row>_<offset>" left column, second field  (offset is a fixed px
-//                       value derived from PnTextW(29), so it can never
-//                       collide with the "_0" slot)
-//     "LA<row>"         left column, first value
-//     "LB<row>"         left column, second value
-//     "R<row>_0"        right column, label / section title / list row
-//     "RV<row>"         right column, value
-//     "RD<index>"       DAILY PROFIT value  (index = day, NOT a row)
-//     "RT<index>"       RECENT TRADES value (index = trade, NOT a row)
-//     "HdrName/HdrSym/HdrStat", "Ft1..Ft5"  header / footer singletons
-//     "BG/HdrLine/Sep/FtLine"               chrome rectangles
-//  The RD/RT namespaces are indexed by list position rather than by row,
-//  so they cannot collide with the R<row> row pool.
+//  Blank the slots that a previous, longer frame used and this frame does
+//  not. It knows NOTHING about pixel offsets, font size or geometry - it
+//  only addresses stable semantic slot names, and only ever blanks objects
+//  that already exist (so it can never create a stray "Label").
 //-------------------------------------------------------------------------
 void PnHideSurplus()
 {
-   int secondFieldOffset=PnTextW(29);
    for(int r=g_PnLeftUsed;r<g_PnLeftPrev && r<PN_MAX_ROWS;r++)
    {
-      PnLabel("L"+IntegerToString(r)+"_0",g_PnLeftX,PnRowY(r),"",clrPnDim,g_PnFont);
-      PnLabel("L"+IntegerToString(r)+"_"+IntegerToString(secondFieldOffset),
-              g_PnLeftX,PnRowY(r),"",clrPnDim,g_PnFont);
-      PnLabel("LA"+IntegerToString(r),g_PnLeftX,PnRowY(r),"",clrPnDim,g_PnFont);
-      PnLabel("LB"+IntegerToString(r),g_PnLeftX,PnRowY(r),"",clrPnDim,g_PnFont);
+      string sr=IntegerToString(r);
+      PnHideExisting("LS_"+sr);
+      PnHideExisting("L1_"+sr); PnHideExisting("V1_"+sr);
+      PnHideExisting("L2_"+sr); PnHideExisting("V2_"+sr);
    }
    for(int r=g_PnRightUsed;r<g_PnRightPrev && r<PN_MAX_ROWS;r++)
    {
-      PnLabel("R"+IntegerToString(r)+"_0",g_PnRightX,PnRowY(r),"",clrPnDim,g_PnFont);
-      PnLabel("RV"+IntegerToString(r),g_PnRightX,PnRowY(r),"",clrPnDim,g_PnFont);
+      string sr=IntegerToString(r);
+      PnHideExisting("RS_"+sr);
+      PnHideExisting("RL_"+sr); PnHideExisting("RV_"+sr);
    }
-   // Blank the value labels of the variable-length recent-trade list.
-   // (DAILY PROFIT always renders all PN_DAYS slots, so it needs no blanking.)
+   // Variable-length recent-trade list (indexed by trade, not by row).
    for(int t=g_PnTrCount;t<PN_TRADES;t++)
-      PnLabel("RT"+IntegerToString(t),g_PnRightX,g_PnBodyTop,"",clrPnDim,g_PnFont);
+      PnHideExisting("RT_"+IntegerToString(t));
 
    g_PnLeftPrev =g_PnLeftUsed;
    g_PnRightPrev=g_PnRightUsed;
@@ -3624,27 +3653,34 @@ void RefreshPanel()
    if(colChars<40) colChars=40;
    g_PnLeftCols=colChars;
 
-   int gapChars=2;                                  // guaranteed gap between fields
-   int pairChars=(colChars-gapChars)/2;             // width of one label+value pair
-   g_PnZ1W=(int)MathMax(12,MathRound(pairChars*0.55))-1;   // label 1
-   g_PnZ2W=pairChars-g_PnZ1W-1;                            // value 1
-   g_PnZ3W=g_PnZ1W;                                        // label 2
-   g_PnZ4W=colChars-(g_PnZ1W+g_PnZ2W+1+gapChars)-g_PnZ3W;  // value 2
-   if(g_PnZ4W<8) g_PnZ4W=8;
+   // REAL PIXEL GAPS - not merely estimated character widths. Each zone has
+   // a pixel origin plus a character budget used only for truncation.
+   double cw=PnCharW();
+   int labelValueGap=10;    // px between a label and its own value
+   int pairGap      =18;    // px between the first and the second pair
+   int usable =g_PnColW-pad;
+   int pairPx =(usable-pairGap)/2;
+   int labelPx=(int)MathRound(pairPx*0.52);
+   int valuePx=pairPx-labelPx;
 
    g_PnZ1=0;
-   g_PnZ2=PnTextW(g_PnZ1W);
-   g_PnZ3=PnTextW(g_PnZ1W+g_PnZ2W+gapChars);
-   g_PnZ4=PnTextW(g_PnZ1W+g_PnZ2W+gapChars+g_PnZ3W);
+   g_PnZ2=labelPx+labelValueGap;
+   g_PnZ3=pairPx+pairGap;
+   g_PnZ4=g_PnZ3+labelPx+labelValueGap;
+
+   g_PnZ1W=(int)MathMax(6,MathFloor((labelPx-labelValueGap)/cw));
+   g_PnZ2W=(int)MathMax(6,MathFloor((valuePx-4)/cw));
+   g_PnZ3W=g_PnZ1W;
+   g_PnZ4W=(int)MathMax(6,MathFloor((double)(usable-g_PnZ4-4)/cw));
 
    int rColChars=(int)MathFloor((double)(g_PnColW-pad)/PnCharW());
    if(rColChars<34) rColChars=34;
    g_PnRightCols=rColChars;
-   g_PnRZ1W=(int)MathMax(12,MathRound(rColChars*0.42));
-   g_PnRZ2W=rColChars-g_PnRZ1W-1;
-   if(g_PnRZ2W<10) g_PnRZ2W=10;
+   int rLabelPx=(int)MathRound((g_PnColW-pad)*0.46);
    g_PnRZ1=0;
-   g_PnRZ2=PnTextW(g_PnRZ1W+1);
+   g_PnRZ2=rLabelPx+labelValueGap;
+   g_PnRZ1W=(int)MathMax(8,MathFloor((rLabelPx-labelValueGap)/cw));
+   g_PnRZ2W=(int)MathMax(8,MathFloor((double)(g_PnColW-pad-g_PnRZ2-4)/cw));
 
    int headerH=g_PnRowH+12;
    g_PnBodyTop=g_PnY+headerH+6;
@@ -3762,10 +3798,11 @@ void RefreshPanel()
       string m1V =UseM1?alV:"OFF";
       color  m1C =UseM1?alC:clrPnDim;
 
-      PnLeftKV2(r++,"H1  Big Direct", h1V, h1C,  "Aligned Bias", alV, alC);
+      PnLeftKV2(r++,"H1  Big Direct", h1V, h1C,  "", "", clrPnDim);
       PnLeftKV2(r++,"M15 Structure",  m15V,m15C, "", "", clrPnDim);
       PnLeftKV2(r++,"M5  Regime",     m5V, m5C,  "", "", clrPnDim);
       PnLeftKV2(r++,"M1  Entry",      m1V, m1C,  "", "", clrPnDim);
+      PnLeftKV2(r++,"Aligned Bias",   alV, alC,  "", "", clrPnDim);
    }
    r++;
 
@@ -3774,8 +3811,10 @@ void RefreshPanel()
    if(!g_SRActive)
    {
       // Module genuinely off: no S/R computation is performed for display.
-      PnLeftKV2(r++,"Status","DISABLED",clrPnDim,"Entry Filter","N/A",clrPnDim);
-      PnLeftKV2(r++,"Nearest Zone","--",clrPnDim,"Confirmation","--",clrPnDim);
+      PnLeftKV2(r++,"Status","DISABLED",clrPnDim,"","",clrPnDim);
+      PnLeftKV2(r++,"Entry Filter","N/A",clrPnDim,"","",clrPnDim);
+      PnLeftKV2(r++,"Nearest Zone","--",clrPnDim,"","",clrPnDim);
+      PnLeftKV2(r++,"Confirmation","--",clrPnDim,"","",clrPnDim);
    }
    else
    {
@@ -3819,12 +3858,13 @@ void RefreshPanel()
       PnLeftKV2(r++,"Status",SRStateToStr(g_SRState),
                     (g_SRState==SR_NO_VALID?clrPnDim:clrPnValue),"","",clrPnDim);
       PnLeftKV2(r++,"Entry Filter",(srBlocked?"BLOCKED":"ALLOWED"),
-                    (srBlocked?clrPnBad:clrPnGood),
-                    "Zones",StringFormat("%d / %d",g_SRZoneCount,SR_MAX_ZONES),clrPnValue);
-      PnLeftKV2(r++,"Nearest Zone",zoneTxt,clrPnValue,
-                    "Direction",dirTxt,dirClr);
+                    (srBlocked?clrPnBad:clrPnGood),"","",clrPnDim);
+      PnLeftKV2(r++,"Nearest Zone",zoneTxt,clrPnValue,"","",clrPnDim);
+      PnLeftKV2(r++,"Direction",dirTxt,dirClr,"","",clrPnDim);
       PnLeftKV2(r++,"Confirmation",StringFormat("%d / %d",confNow,g_SRBreakConfirmBars),
                     (confNow>0?clrPnWarn:clrPnValue),"","",clrPnDim);
+      PnLeftKV2(r++,"Zones",StringFormat("%d / %d",g_SRZoneCount,SR_MAX_ZONES),
+                    clrPnValue,"","",clrPnDim);
       if(srBlocked && srWhy!="")
          PnLeftKV2(r++,"Block Reason",srWhy,clrPnBad,"","",clrPnDim);   // wide row
    }
@@ -3853,7 +3893,8 @@ void RefreshPanel()
                        (UseM1?clrPnDim:clrPnWarn),
                        "Active / Ready",StringFormat("%d / %d",g_PanelActiveSetups,g_PanelReadySetups),
                        clrPnValue);
-         PnLeftKV2(r++,"Breakout","--",clrPnDim,"Permission","--",clrPnDim);
+         PnLeftKV2(r++,"Breakout","--",clrPnDim,"","",clrPnDim);
+         PnLeftKV2(r++,"Permission","--",clrPnDim,"","",clrPnDim);
       }
       else
       {
@@ -3892,61 +3933,28 @@ void RefreshPanel()
          PnLeftKV2(r++,"ID / Direction",StringFormat("#%d  %s",(int)s.id,dirS),dirC,
                        "Active / Ready",StringFormat("%d / %d",g_PanelActiveSetups,g_PanelReadySetups),
                        clrPnValue);
-         PnLeftKV2(r++,"Stage",stage,dirC,
-                       "Validity",(s.active?"VALID":"RETIRED"),(s.active?clrPnGood:clrPnDim));
-         PnLeftKV2(r++,"A",aTxt,clrPnValue,"B",bTxt,clrPnValue);
-         PnLeftKV2(r++,"C",cTxt,clrPnValue,"Trigger",tTxt,
-                       (s.trigger>0?clrPnWarn:clrPnDim));
-         PnLeftKV2(r++,"Breakout",boTxt,boClr,
-                       "Quality",s.breakoutQuality,
+         PnLeftKV2(r++,"Stage",stage,dirC,"","",clrPnDim);
+         PnLeftKV2(r++,"Validity",(s.active?"VALID":"RETIRED"),
+                       (s.active?clrPnGood:clrPnDim),"","",clrPnDim);
+         PnLeftKV2(r++,"Active / Ready",
+                       StringFormat("%d / %d",g_PanelActiveSetups,g_PanelReadySetups),
+                       clrPnValue,"","",clrPnDim);
+         PnLeftKV2(r++,"A",aTxt,clrPnValue,"","",clrPnDim);
+         PnLeftKV2(r++,"B",bTxt,clrPnValue,"","",clrPnDim);
+         PnLeftKV2(r++,"C",cTxt,clrPnValue,"","",clrPnDim);
+         PnLeftKV2(r++,"Trigger",tTxt,(s.trigger>0?clrPnWarn:clrPnDim),"","",clrPnDim);
+         PnLeftKV2(r++,"Breakout",boTxt,boClr,"","",clrPnDim);
+         PnLeftKV2(r++,"Quality",s.breakoutQuality,
                        (s.breakoutQuality=="PASS"?clrPnGood:
-                        s.breakoutQuality=="WEAK"?clrPnWarn:clrPnDim));
-         PnLeftKV2(r++,"Pullback",(s.pullbackDistance>0?DoubleToString(s.pullbackDistance,2):"--"),
-                       clrPnValue,
-                       "Entry Window",winTxt,clrPnValue);
+                        s.breakoutQuality=="WEAK"?clrPnWarn:clrPnDim),"","",clrPnDim);
+         PnLeftKV2(r++,"Pullback",
+                       (s.pullbackDistance>0?DoubleToString(s.pullbackDistance,2):"--"),
+                       clrPnValue,"","",clrPnDim);
+         PnLeftKV2(r++,"Entry Window",winTxt,clrPnValue,"","",clrPnDim);
          PnLeftKV2(r++,"Permission",permTxt2,permClr2,"","",clrPnDim);   // wide row
          if(s.entryStatus=="BLOCKED" && s.blockReason!="")
             PnLeftKV2(r++,"Block Reason",s.blockReason,clrPnBad,"","",clrPnDim);
       }
-   }
-   r++;
-
-   // ---- G. SYSTEM STATS (engine / execution diagnostics) ----
-   PnLeftSection(r++,"SYSTEM STATS");
-   {
-      PnLeftKV2(r++,"Pivots H / L",StringFormat("%d / %d",g_Cnt_M1PivotHigh,g_Cnt_M1PivotLow),clrPnValue,
-                    "Triggers",StringFormat("%d",g_Cnt_Triggers),clrPnValue);
-      PnLeftKV2(r++,"Setups Created",StringFormat("%d",g_Cnt_SetupsCreated),clrPnValue,
-                    "Active Now",StringFormat("%d",g_PanelActiveSetups),clrPnValue);
-      PnLeftKV2(r++,"Invalid / Exp",StringFormat("%d / %d",g_Cnt_SetupsInvalidated,g_Cnt_SetupsExpired),
-                    clrPnValue,
-                    "Cap Skipped",StringFormat("%d",g_Cnt_SetupsSkippedCap),
-                    (g_Cnt_SetupsSkippedCap>0?clrPnWarn:clrPnValue));
-      PnLeftKV2(r++,"Breakouts",StringFormat("%d",g_Cnt_Breakouts),clrPnValue,
-                    "Qual P / W",StringFormat("%d / %d",g_Cnt_BOQualityPass,g_Cnt_BOQualityWeak),
-                    clrPnValue);
-      PnLeftKV2(r++,"Entries",StringFormat("%d / %d attempts",g_Cnt_EntryExecuted,g_Cnt_EntryAttempts),
-                    (g_Cnt_EntryExecuted>0?clrPnGood:clrPnValue),
-                    "Blocked / Fail",StringFormat("%d / %d",g_Cnt_EntryBlocked,g_Cnt_EntryFailed),
-                    ((g_Cnt_EntryBlocked+g_Cnt_EntryFailed)>0?clrPnWarn:clrPnValue));
-      int rejTotal=g_Cnt_RejectLot+g_Cnt_RejectStops+g_Cnt_RejectMargin+
-                   g_Cnt_RejectFilling+g_Cnt_RejectBroker+g_Cnt_RejectOther;
-      PnLeftKV2(r++,"Rejected",StringFormat("%d",rejTotal),(rejTotal>0?clrPnBad:clrPnGood),
-                    "Long / Short",StringFormat("%d / %d",g_LongTrades,g_ShortTrades),clrPnValue);
-      if(rejTotal>0)
-         PnLeftKV2(r++,"Rej L/S/M",StringFormat("%d/%d/%d",g_Cnt_RejectLot,g_Cnt_RejectStops,g_Cnt_RejectMargin),
-                       clrPnBad,
-                       "Rej F/B/O",StringFormat("%d/%d/%d",g_Cnt_RejectFilling,g_Cnt_RejectBroker,g_Cnt_RejectOther),
-                       clrPnBad);
-      double avgHold=(g_Cnt_TargetCloses>0)?g_SumTargetHoldSec/g_Cnt_TargetCloses:0.0;
-      double avgMae =(g_Cnt_TargetCloses>0)?g_SumMAE/g_Cnt_TargetCloses:0.0;
-      PnLeftKV2(r++,"Target Closes",StringFormat("%d",g_Cnt_TargetCloses),
-                    (g_Cnt_TargetCloses>0?clrPnGood:clrPnValue),
-                    "Target Profit",StringFormat("%.2f USD",g_SumTargetProfit),
-                    (g_SumTargetProfit>0?clrPnGood:clrPnValue));
-      PnLeftKV2(r++,"Avg Hold",(g_Cnt_TargetCloses>0?StringFormat("%.0f sec",avgHold):"--"),clrPnValue,
-                    "Avg MAE",(g_Cnt_TargetCloses>0?StringFormat("%.2f USD",avgMae):"--"),
-                    (avgMae>0?clrPnWarn:clrPnValue));
    }
    r++;
 
@@ -3960,19 +3968,22 @@ void RefreshPanel()
       // Intraday equity drawdown (display-only tracking, see OnTick hook).
       string ddTxt=(g_PnDayPeakEquity>0)?StringFormat("%.2f %%",g_PnDayDDPct):"--";
 
-      PnLeftKV2(r++,"Trades",StringFormat("%d",g_PnTodayTrades),clrPnValue,
-                    "Max Drawdown",ddTxt,(g_PnDayDDPct>0?clrPnWarn:clrPnValue));
+      PnLeftKV2(r++,"Trades",StringFormat("%d",g_PnTodayTrades),clrPnValue,"","",clrPnDim);
       PnLeftKV2(r++,"Win Rate",
                     (g_PnTodayWins+g_PnTodayLosses>0?StringFormat("%.2f %%",wr):"--"),
-                    (wr>=50?clrPnGood:clrPnWarn),
-                    "Daily P/L",StringFormat("%+.2f USD",todayNet),PnPLColor(todayNet));
-      PnLeftKV2(r++,"Total Profit",StringFormat("%.2f USD",g_PnTodayWinSum),clrPnGood,
-                    "Total Loss",StringFormat("%.2f USD",g_PnTodayLossSum),
-                    (g_PnTodayLossSum<0?clrPnBad:clrPnValue));
+                    (wr>=50?clrPnGood:clrPnWarn),"","",clrPnDim);
+      PnLeftKV2(r++,"Daily P/L",StringFormat("%+.2f USD",todayNet),
+                    PnPLColor(todayNet),"","",clrPnDim);
+      PnLeftKV2(r++,"Total Profit",StringFormat("%.2f USD",g_PnTodayWinSum),
+                    clrPnGood,"","",clrPnDim);
+      PnLeftKV2(r++,"Total Loss",StringFormat("%.2f USD",g_PnTodayLossSum),
+                    (g_PnTodayLossSum<0?clrPnBad:clrPnValue),"","",clrPnDim);
       PnLeftKV2(r++,"Consec Wins",StringFormat("%d",g_PnConsWins),
-                    (g_PnConsWins>0?clrPnGood:clrPnValue),
-                    "Consec Losses",StringFormat("%d",g_ConsLoss),
-                    (g_ConsLoss>0?clrPnBad:clrPnValue));
+                    (g_PnConsWins>0?clrPnGood:clrPnValue),"","",clrPnDim);
+      PnLeftKV2(r++,"Consec Losses",StringFormat("%d",g_ConsLoss),
+                    (g_ConsLoss>0?clrPnBad:clrPnValue),"","",clrPnDim);
+      PnLeftKV2(r++,"Max Drawdown",ddTxt,
+                    (g_PnDayDDPct>0?clrPnWarn:clrPnValue),"","",clrPnDim);
       color dsClr; string dsTxt=PnDetailStatus(dsClr);
       color mapped=(dsClr==clrPnBad)?clrPnBad:dsClr;
       PnLeftKV2(r++,"EA Status",dsTxt,mapped,"","",clrPnDim);   // wide row
@@ -4023,7 +4034,9 @@ void RefreshPanel()
       for(int d=0;d<PN_DAYS;d++)
       {
          string lbl=(g_PnDayLabel[d]!="")?g_PnDayLabel[d]:"--";
-         PnRightRaw(rr,0,PnPad(lbl,g_PnRZ1W),clrPnLabel);
+         PnSlotR("RL",rr,g_PnRZ1,PnFit(lbl,g_PnRZ1W),clrPnLabel);
+         PnHideExisting("RS_"+IntegerToString(rr));
+         PnHideExisting("RV_"+IntegerToString(rr));
          string vTxt; color vClr;
          if(!g_PnDayUsed[d])
          {
@@ -4037,7 +4050,7 @@ void RefreshPanel()
             vTxt=PnPadLeft(StringFormat("%+.2f USD%s",v,pctTxt),g_PnRZ2W);
             vClr=PnPLColor(v);
          }
-         PnLabel("RD"+IntegerToString(d),g_PnRightX+g_PnRZ2,PnRowY(rr),vTxt,vClr,g_PnFont);
+         PnLabel("RD_"+IntegerToString(d),g_PnRightX+g_PnRZ2,PnRowY(rr),vTxt,vClr,g_PnFont);
          rr++;
       }
    }
@@ -4054,25 +4067,91 @@ void RefreshPanel()
       if(wPL<7) wPL=7;
       int xRest=PnTextW(wTime+wType);
 
-      PnRightRaw(rr,0,PnPad("Time",wTime)+PnPad("Type",wType),clrPnDim);
+      PnSlotR("RL",rr,g_PnRZ1,PnPad("Time",wTime)+PnPad("Type",wType),clrPnDim);
       PnLabel("RTH",g_PnRightX+xRest,PnRowY(rr),
               PnPad("Result",wRes)+PnPadLeft("P/L",wPL),clrPnDim,g_PnFont);
+      PnHideExisting("RS_"+IntegerToString(rr));
+      PnHideExisting("RV_"+IntegerToString(rr));
       rr++;
 
       if(g_PnTrCount<=0)
-         PnRightRaw(rr++,0,"  No closed trades yet",clrPnDim);
+      {
+         PnSlotR("RL",rr,g_PnRZ1,"  No closed trades yet",clrPnDim);
+         PnHideExisting("RS_"+IntegerToString(rr));
+         PnHideExisting("RV_"+IntegerToString(rr));
+         rr++;
+      }
       else
       {
          for(int t=0;t<g_PnTrCount;t++)
          {
             bool win=(g_PnTrPL[t]>=0);
-            PnRightRaw(rr,0,PnPad(g_PnTrTime[t],wTime)+PnPad(g_PnTrType[t],wType),clrPnValue);
-            PnLabel("RT"+IntegerToString(t),g_PnRightX+xRest,PnRowY(rr),
+            PnSlotR("RL",rr,g_PnRZ1,
+                    PnPad(g_PnTrTime[t],wTime)+PnPad(g_PnTrType[t],wType),clrPnValue);
+            PnHideExisting("RS_"+IntegerToString(rr));
+            PnHideExisting("RV_"+IntegerToString(rr));
+            PnLabel("RT_"+IntegerToString(t),g_PnRightX+xRest,PnRowY(rr),
                     PnPad(win?"WIN":"LOSS",wRes)+PnPadLeft(StringFormat("%+.2f",g_PnTrPL[t]),wPL),
                     (win?clrPnGood:clrPnBad),g_PnFont);
             rr++;
          }
       }
+   }
+   rr++;
+
+   // ---- RIGHT D. SYSTEM STATS (moved here to balance the two columns) ----
+   //      Uses ONLY the existing g_Cnt_* / g_Sum* counters - no invented data.
+   PnRightSection(rr++,"SYSTEM STATS");
+   {
+      PnRightKV(rr++,"Pivots H / L",
+                StringFormat("%d / %d",g_Cnt_M1PivotHigh,g_Cnt_M1PivotLow),clrPnValue);
+      PnRightKV(rr++,"Setups Created",StringFormat("%d",g_Cnt_SetupsCreated),clrPnValue);
+      PnRightKV(rr++,"Active Now",StringFormat("%d",g_PanelActiveSetups),clrPnValue);
+      PnRightKV(rr++,"Invalid / Exp",
+                StringFormat("%d / %d",g_Cnt_SetupsInvalidated,g_Cnt_SetupsExpired),clrPnValue);
+      PnRightKV(rr++,"Cap Skipped",StringFormat("%d",g_Cnt_SetupsSkippedCap),
+                (g_Cnt_SetupsSkippedCap>0?clrPnWarn:clrPnValue));
+
+      PnRightKV(rr++,"Triggers",StringFormat("%d",g_Cnt_Triggers),clrPnValue);
+      PnRightKV(rr++,"Breakouts",StringFormat("%d",g_Cnt_Breakouts),clrPnValue);
+      PnRightKV(rr++,"Quality P / W",
+                StringFormat("%d / %d",g_Cnt_BOQualityPass,g_Cnt_BOQualityWeak),clrPnValue);
+
+      PnRightKV(rr++,"Entries",StringFormat("%d",g_Cnt_EntryExecuted),
+                (g_Cnt_EntryExecuted>0?clrPnGood:clrPnValue));
+      PnRightKV(rr++,"Attempts",StringFormat("%d",g_Cnt_EntryAttempts),clrPnValue);
+      PnRightKV(rr++,"Blocked",StringFormat("%d",g_Cnt_EntryBlocked),
+                (g_Cnt_EntryBlocked>0?clrPnWarn:clrPnValue));
+      PnRightKV(rr++,"Failed",StringFormat("%d",g_Cnt_EntryFailed),
+                (g_Cnt_EntryFailed>0?clrPnBad:clrPnValue));
+
+      int rejTotal=g_Cnt_RejectLot+g_Cnt_RejectStops+g_Cnt_RejectMargin+
+                   g_Cnt_RejectFilling+g_Cnt_RejectBroker+g_Cnt_RejectOther;
+      PnRightKV(rr++,"Rejected",StringFormat("%d",rejTotal),
+                (rejTotal>0?clrPnBad:clrPnGood));
+      if(rejTotal>0)
+      {
+         PnRightKV(rr++,"Rej L/S/M",
+                   StringFormat("%d / %d / %d",g_Cnt_RejectLot,g_Cnt_RejectStops,g_Cnt_RejectMargin),
+                   clrPnBad);
+         PnRightKV(rr++,"Rej F/B/O",
+                   StringFormat("%d / %d / %d",g_Cnt_RejectFilling,g_Cnt_RejectBroker,g_Cnt_RejectOther),
+                   clrPnBad);
+      }
+      PnRightKV(rr++,"Long / Short",
+                StringFormat("%d / %d",g_LongTrades,g_ShortTrades),clrPnValue);
+
+      double avgHold=(g_Cnt_TargetCloses>0)?g_SumTargetHoldSec/g_Cnt_TargetCloses:0.0;
+      double avgMae =(g_Cnt_TargetCloses>0)?g_SumMAE/g_Cnt_TargetCloses:0.0;
+      PnRightKV(rr++,"Target Closes",StringFormat("%d",g_Cnt_TargetCloses),
+                (g_Cnt_TargetCloses>0?clrPnGood:clrPnValue));
+      PnRightKV(rr++,"Target Profit",StringFormat("%.2f USD",g_SumTargetProfit),
+                (g_SumTargetProfit>0?clrPnGood:clrPnValue));
+      PnRightKV(rr++,"Avg Hold",
+                (g_Cnt_TargetCloses>0?StringFormat("%.0f sec",avgHold):"--"),clrPnValue);
+      PnRightKV(rr++,"Avg MAE",
+                (g_Cnt_TargetCloses>0?StringFormat("%.2f USD",avgMae):"--"),
+                (avgMae>0?clrPnWarn:clrPnValue));
    }
 
    //=====================  FINAL SIZING OF THE CHROME  ==================
