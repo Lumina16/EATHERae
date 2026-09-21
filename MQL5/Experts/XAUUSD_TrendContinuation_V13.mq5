@@ -126,7 +126,8 @@ input int    PanelWidth             = 900;   // total panel width (px)
 input int    PanelMinHeight         = 0;     // 0 = auto height
 input int    PanelRowHeight         = 14;    // row pitch (px)
 input int    PanelFontSize          = 8;     // body font size
-input int    PanelHistoryRefreshSec = 5;     // history re-scan interval (s)
+input int    PanelRefreshMs         = 300;   // dashboard refresh throttle (ms)
+input int    PanelHistoryRefreshSec = 60;    // FULL history re-scan interval (s)
 
 input group "DEBUG"
 input bool   DebugMode  = false;
@@ -327,10 +328,48 @@ int g_Cnt_EntryAttempts=0, g_Cnt_EntryExecuted=0, g_Cnt_EntryBlocked=0, g_Cnt_En
 int g_Cnt_RejectLot=0, g_Cnt_RejectStops=0, g_Cnt_RejectMargin=0;
 int g_Cnt_RejectFilling=0, g_Cnt_RejectBroker=0, g_Cnt_RejectOther=0;
 
-// ---- Dashboard panel shared state (UI only - no trading influence) ----
-bool   g_PnHistoryDirty=true;   // set by OnTradeTransaction: force history re-scan
+//=========================================================================
+//  DASHBOARD PANEL SHARED STATE  (DISPLAY ONLY - ZERO TRADING INFLUENCE)
+//
+//  Nothing below this comment is ever read by the strategy, the S/R
+//  engine, the setup state machine, risk management or order execution.
+//  Every variable here is written by the engine (cheap assignments) or by
+//  the throttled panel path, and read only by the renderer.
+//=========================================================================
+bool   g_PnHistoryDirty=true;   // a deeper (full) history re-scan is due
 double g_PnDayPeakEquity=0;     // intraday equity peak (display drawdown)
 double g_PnDayDDPct=0;          // intraday equity drawdown %
+
+// ---- visibility + throttling ----
+bool   g_PanelVisible=false;    // are panel objects currently on the chart?
+uint   g_PanelLastDrawMs=0;     // GetTickCount() of the last dashboard render
+bool   g_PanelDirty=true;       // force a render on the next throttle window
+bool   g_TimerActive=false;     // was EventSetMillisecondTimer() installed?
+
+// ---- chart-annotation dirty flags (event driven, never per tick) ----
+bool   g_HTFVisualDirty=true;   // H1/M15/M5 swing markers need a redraw
+bool   g_SRVisualDirty=true;    // M30 S/R rectangles need a redraw
+bool   g_SetupVisualDirty=true; // M1 setup anchors/triggers need a redraw
+
+// ---- cheap engine-maintained display cache ----
+int    g_PanelOpenTradeCount=0; // refreshed by ManageOpenPositions()
+int    g_PanelBuyCount=0;
+int    g_PanelSellCount=0;
+double g_PanelOpenVolume=0;
+double g_PanelAvgBuy=0, g_PanelAvgSell=0;
+double g_PanelFloatPL=0;
+
+// ---- cached decision snapshots (filled ONLY in the throttled path) ----
+bool              g_PanelEntryPermission=false;
+string            g_PanelBlockReason="";
+bool              g_PanelSRBlocked=false;
+string            g_PanelSRReason="";
+ENUM_ALIGN_RESULT g_PanelAlignedBias=ALIGN_CONFLICT;
+bool              g_PanelSpreadOK=true;
+bool              g_PanelVolOK=true;
+bool              g_PanelInSession=true;
+int               g_PanelActiveSetups=0;
+int               g_PanelReadySetups=0;
 
 // ---- LAST ACTION ----
 string g_LastAction = "Initialized - replaying history";
@@ -356,6 +395,11 @@ bool   ExecuteSetupTrade(M1Setup &s,double refPrice);
 void   RefreshPanel();
 void   ClearPanelObjects();
 void   DetermineStatus(string &status,color &clr);
+void   PnPushClosedTrade(datetime dtime,bool wasBuy,double profit);
+void   UpdateChartVisuals();
+bool   UpdateChartVisualsIfDirty();
+void   PanelRefreshStateCache();
+void   PanelTick();
 void   PrintBacktestSummary();
 void   FeedPivotBullish(int idx,ENUM_SWING_TYPE type,double price,datetime time,double atrM1);
 void   FeedPivotBearish(int idx,ENUM_SWING_TYPE type,double price,datetime time,double atrM1);
@@ -577,7 +621,8 @@ void CheckNewDay()
    g_HaltedDaily=false; g_HaltedConsec=false; g_HaltedFloat=false;
    g_PnDayPeakEquity=AccountInfoDouble(ACCOUNT_EQUITY);   // panel: new day, new peak
    g_PnDayDDPct=0;
-   g_PnHistoryDirty=true;                                  // panel: refresh day buckets
+   g_PnHistoryDirty=true;                                  // panel: rebuild day buckets once
+   g_PanelDirty=true;
 }
 
 bool EntriesHalted()
@@ -649,6 +694,8 @@ void UpdateTFStructure(TFStruct &st,ENUM_TIMEFRAMES tf,int atrHandle,int shift,b
 
    if(!newHighPivot && !newLowPivot)
       return;
+
+   if(live) g_HTFVisualDirty=true;   // display-only: swing markers moved
 
    double atr=AtrVal(atrHandle,shift+1);
    double expMin=(atr>0 && g_StructureExpansion>0) ? atr*g_StructureExpansion : 0.0;
@@ -803,6 +850,8 @@ void DisableM30SR()
    ResetSRState();
    g_SRState=SR_DISABLED;
    DeleteSRObjects();
+   g_SRVisualDirty=false;   // nothing left to draw
+   g_PanelDirty=true;
    if(hadSomething)
       Print("[SR] M30 Support/Resistance module DISABLED - state cleared, chart objects removed.");
 }
@@ -990,7 +1039,8 @@ void BuildM30SRZones()
              TimeToString(tm[MathMin(windowOldestIdx,fetchCount-1)],TIME_DATE|TIME_MINUTES),
              TimeToString(newestTime,TIME_DATE|TIME_MINUTES),
              rawCount));
-      DrawSRZones();
+      g_SRVisualDirty=true;   // redrawn by the throttled visual path
+      g_PanelDirty=true;
       return;
    }
 
@@ -1071,7 +1121,8 @@ void BuildM30SRZones()
           TimeToString(newestTime,TIME_DATE|TIME_MINUTES),
           windowOldestIdx+1,rawCount,g_SRZoneCount,preserved,resurrectSuppressed,atr));
 
-   DrawSRZones();
+   g_SRVisualDirty=true;   // redrawn by the throttled visual path
+   g_PanelDirty=true;
 }
 
 // Once per COMPLETED M1 candle: advance each zone's breakout-confirmation
@@ -1385,11 +1436,12 @@ void CreateM1Setup(ENUM_BIAS dir,double aPrice,datetime aTime)
 
    g_Setups[n]=s;
    g_Cnt_SetupsCreated++;
+   g_SetupVisualDirty=true; g_PanelDirty=true;
 
    LogM1(StringFormat("New %s setup #%d seeded at A=%.2f @ %s",
          BiasToStr(dir),(int)s.id,aPrice,TimeToString(aTime,TIME_MINUTES)));
 
-   DrawSetupAnchor((int)s.id,"A",aPrice,aTime,clrDodgerBlue,159);
+   g_SetupVisualDirty=true;
 }
 
 void InvalidateM1Setup(int idx,string reason)
@@ -1406,6 +1458,7 @@ void InvalidateM1Setup(int idx,string reason)
 
    DeleteSetupVisuals((int)id);
    g_Setups[idx].active=false;
+   g_SetupVisualDirty=true; g_PanelDirty=true;
 }
 
 void ExpireOldSetups()
@@ -1451,7 +1504,7 @@ void FeedPivotBullish(int idx,ENUM_SWING_TYPE type,double price,datetime time,do
             s.impulseDistance=s.B-s.A;
             s.state=MS_WAIT_C;
             LogM1(StringFormat("#%d BULL B=%.2f (impulse %.2f->%.2f)",(int)s.id,s.B,s.A,s.B));
-            DrawSetupAnchor((int)s.id,"B",s.B,s.Bt,clrLime,159);
+            g_SetupVisualDirty=true;
          }
          break;
 
@@ -1467,7 +1520,7 @@ void FeedPivotBullish(int idx,ENUM_SWING_TYPE type,double price,datetime time,do
             if(s.Ct==0 || price<s.C)
             {
                s.C=price; s.Ct=time;
-               DrawSetupAnchor((int)s.id,"C",s.C,s.Ct,clrOrange,159);
+               g_SetupVisualDirty=true;
             }
             double pullback=s.B-s.C;
             s.pullbackDistance=pullback;
@@ -1482,7 +1535,7 @@ void FeedPivotBullish(int idx,ENUM_SWING_TYPE type,double price,datetime time,do
             s.B=price; s.Bt=time; s.C=0; s.Ct=0;
             s.impulseDistance=s.B-s.A;
             LogM1(StringFormat("#%d BULL B extended -> %.2f",(int)s.id,s.B));
-            DrawSetupAnchor((int)s.id,"B",s.B,s.Bt,clrLime,159);
+            g_SetupVisualDirty=true;
          }
          break;
 
@@ -1499,7 +1552,7 @@ void FeedPivotBullish(int idx,ENUM_SWING_TYPE type,double price,datetime time,do
             {
                s.C=price; s.Ct=time;
                s.pullbackDistance=s.B-s.C;
-               DrawSetupAnchor((int)s.id,"C",s.C,s.Ct,clrOrange,159);
+               g_SetupVisualDirty=true;
             }
          }
          else if(type==SWING_HIGH && time>s.Ct && price>s.C)
@@ -1513,7 +1566,7 @@ void FeedPivotBullish(int idx,ENUM_SWING_TYPE type,double price,datetime time,do
             g_Cnt_Triggers++;
             LogM1(StringFormat("#%d BULL TRIGGER LOCKED=%.2f",(int)s.id,s.trigger));
             SetLastAction("BUY #"+IntegerToString((int)s.id)+" trigger locked");
-            DrawSetupTrigger((int)s.id,s.trigger,s.triggerTime,clrAqua);
+            g_SetupVisualDirty=true; g_PanelDirty=true;
          }
          break;
 
@@ -1537,8 +1590,9 @@ void FeedPivotBullish(int idx,ENUM_SWING_TYPE type,double price,datetime time,do
                s.entryStatus="";
                s.blockReason="";
                LogM1(StringFormat("#%d BULL recovery failed -> C=%.2f (trigger reset)",(int)s.id,s.C));
-               DrawSetupAnchor((int)s.id,"C",s.C,s.Ct,clrOrange,159);
+               g_SetupVisualDirty=true;
                DeleteSetupTrigger((int)s.id);
+               g_SetupVisualDirty=true; g_PanelDirty=true;
             }
          }
          break;
@@ -1561,7 +1615,7 @@ void FeedPivotBearish(int idx,ENUM_SWING_TYPE type,double price,datetime time,do
             s.impulseDistance=s.A-s.B;
             s.state=MS_WAIT_C;
             LogM1(StringFormat("#%d BEAR B=%.2f (impulse %.2f->%.2f)",(int)s.id,s.B,s.A,s.B));
-            DrawSetupAnchor((int)s.id,"B",s.B,s.Bt,clrTomato,159);
+            g_SetupVisualDirty=true;
          }
          break;
 
@@ -1577,7 +1631,7 @@ void FeedPivotBearish(int idx,ENUM_SWING_TYPE type,double price,datetime time,do
             if(s.Ct==0 || price>s.C)
             {
                s.C=price; s.Ct=time;
-               DrawSetupAnchor((int)s.id,"C",s.C,s.Ct,clrOrange,159);
+               g_SetupVisualDirty=true;
             }
             double pullback=s.C-s.B;
             s.pullbackDistance=pullback;
@@ -1592,7 +1646,7 @@ void FeedPivotBearish(int idx,ENUM_SWING_TYPE type,double price,datetime time,do
             s.B=price; s.Bt=time; s.C=0; s.Ct=0;
             s.impulseDistance=s.A-s.B;
             LogM1(StringFormat("#%d BEAR B extended -> %.2f",(int)s.id,s.B));
-            DrawSetupAnchor((int)s.id,"B",s.B,s.Bt,clrTomato,159);
+            g_SetupVisualDirty=true;
          }
          break;
 
@@ -1609,7 +1663,7 @@ void FeedPivotBearish(int idx,ENUM_SWING_TYPE type,double price,datetime time,do
             {
                s.C=price; s.Ct=time;
                s.pullbackDistance=s.C-s.B;
-               DrawSetupAnchor((int)s.id,"C",s.C,s.Ct,clrOrange,159);
+               g_SetupVisualDirty=true;
             }
          }
          else if(type==SWING_LOW && time>s.Ct && price<s.C)
@@ -1623,7 +1677,7 @@ void FeedPivotBearish(int idx,ENUM_SWING_TYPE type,double price,datetime time,do
             g_Cnt_Triggers++;
             LogM1(StringFormat("#%d BEAR TRIGGER LOCKED=%.2f",(int)s.id,s.trigger));
             SetLastAction("SELL #"+IntegerToString((int)s.id)+" trigger locked");
-            DrawSetupTrigger((int)s.id,s.trigger,s.triggerTime,clrMagenta);
+            g_SetupVisualDirty=true; g_PanelDirty=true;
          }
          break;
 
@@ -1647,8 +1701,9 @@ void FeedPivotBearish(int idx,ENUM_SWING_TYPE type,double price,datetime time,do
                s.entryStatus="";
                s.blockReason="";
                LogM1(StringFormat("#%d BEAR recovery failed -> C=%.2f (trigger reset)",(int)s.id,s.C));
-               DrawSetupAnchor((int)s.id,"C",s.C,s.Ct,clrOrange,159);
+               g_SetupVisualDirty=true;
                DeleteSetupTrigger((int)s.id);
+               g_SetupVisualDirty=true; g_PanelDirty=true;
             }
          }
          break;
@@ -1843,6 +1898,7 @@ void CheckSetupBreakout(int idx,MqlTick &tk)
    // survive; a new setup will be seeded by the next qualifying pivot).
    DeleteSetupVisuals((int)s.id);
    s.active=false;
+   g_SetupVisualDirty=true; g_PanelDirty=true;
    g_Setups[idx]=s;
 }
 
@@ -2175,6 +2231,11 @@ void ManageOpenPositions()
 {
    double totalFloat=0;
 
+   // display-only accumulators (cost: a few adds inside a loop the engine
+   // already runs every tick - the panel never re-walks the positions).
+   int    pnTotal=0, pnBuys=0, pnSells=0;
+   double pnVol=0, pnBuyVP=0, pnBuyV=0, pnSellVP=0, pnSellV=0;
+
    for(int i=PositionsTotal()-1;i>=0;i--)
    {
       ulong t=PositionGetTicket(i); if(t==0) continue;
@@ -2189,6 +2250,16 @@ void ManageOpenPositions()
       if(profit<g_Tracks[ti].minFloat) g_Tracks[ti].minFloat=profit;
 
       totalFloat+=profit;
+
+      {
+         double pvol=PositionGetDouble(POSITION_VOLUME);
+         double popen=PositionGetDouble(POSITION_PRICE_OPEN);
+         pnTotal++; pnVol+=pvol;
+         if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY)
+         { pnBuys++;  pnBuyV+=pvol;  pnBuyVP+=popen*pvol; }
+         else
+         { pnSells++; pnSellV+=pvol; pnSellVP+=popen*pvol; }
+      }
 
       if(profit>=g_ProfitTargetUSD)
       {
@@ -2211,6 +2282,15 @@ void ManageOpenPositions()
    }
 
    g_TotalFloat=totalFloat;
+
+   // ---- publish the open-trade snapshot for the dashboard ----
+   g_PanelOpenTradeCount=pnTotal;
+   g_PanelBuyCount=pnBuys;
+   g_PanelSellCount=pnSells;
+   g_PanelOpenVolume=pnVol;
+   g_PanelFloatPL=totalFloat;
+   g_PanelAvgBuy =(pnBuyV >0)?pnBuyVP /pnBuyV :0.0;
+   g_PanelAvgSell=(pnSellV>0)?pnSellVP/pnSellV:0.0;
 
    if(g_MaxFloatingLossUSD>0 && totalFloat<=-g_MaxFloatingLossUSD && !g_HaltedFloat)
    {
@@ -2260,7 +2340,13 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    if(profit>0)      { g_Wins++;   g_SumWinProfit+=profit;  if(profit>g_LargestWin)  g_LargestWin=profit; }
    else if(profit<0) { g_Losses++; g_SumLossProfit+=profit; if(profit<g_LargestLoss) g_LargestLoss=profit; }
 
-   g_PnHistoryDirty=true;   // panel: recent-trades / daily series need a re-scan
+   // ---- DISPLAY CACHE: update incrementally, do NOT rescan history ----
+   {
+      long dtype=HistoryDealGetInteger(trans.deal,DEAL_TYPE);
+      datetime dtime=(datetime)HistoryDealGetInteger(trans.deal,DEAL_TIME);
+      PnPushClosedTrade(dtime,(dtype==DEAL_TYPE_SELL),profit);
+   }
+   g_PanelDirty=true;
 
    g_LastAction=StringFormat("Trade closed  P/L $%.2f  (Total $%.2f)",profit,g_TotalRealizedPL);
    PrintFormat("[TRADE] Closed positionId=%I64d profit=%.2f | Total=%.2f Wins=%d Losses=%d Streak=%d",
@@ -2426,6 +2512,20 @@ int OnInit()
 
    EvaluateSRState();   // safe: returns SR_DISABLED when the module is off
 
+   // ---- dashboard: install the refresh timer (live only; the tester has
+   //      no real time base, so it falls back to GetTickCount throttling
+   //      driven from OnTick - see PanelTick()). ----
+   g_PanelVisible=false;
+   g_PanelDirty=true;
+   g_PanelLastDrawMs=GetTickCount();
+   g_HTFVisualDirty=true; g_SRVisualDirty=g_SRActive; g_SetupVisualDirty=true;
+   g_TimerActive=false;
+   if(DebugMode && !MQLInfoInteger(MQL_TESTER))
+   {
+      int ms=MathMax(50,MathMin(PanelRefreshMs,5000));
+      if(EventSetMillisecondTimer(ms)) g_TimerActive=true;
+   }
+
    g_InitComplete=true;
 
    SetLastAction("Initialized - "+IntegerToString(CountActiveSetups())+" setups warmed, scanning live");
@@ -2445,6 +2545,8 @@ void OnDeinit(const int reason)
    if(g_ATR_M5 !=INVALID_HANDLE) IndicatorRelease(g_ATR_M5);
    if(g_ATR_M1 !=INVALID_HANDLE) IndicatorRelease(g_ATR_M1);
    g_ATR_H1=g_ATR_M30=g_ATR_M15=g_ATR_M5=g_ATR_M1=INVALID_HANDLE;
+
+   if(g_TimerActive) { EventKillTimer(); g_TimerActive=false; }
 
    DeleteSRObjects();
    ClearPanelObjects();
@@ -2491,10 +2593,76 @@ void OnTick()
    ProcessSetupsOnTick();
    ManageOpenPositions();
 
-   if(DebugMode)
-      RefreshPanel();
-   else
-      ClearPanelObjects();
+   // ---- UI: throttled. In the tester (and if the timer failed to
+   //      install) this is the only driver; it early-outs in a couple of
+   //      instructions when the refresh window has not elapsed, so heavy
+   //      tick streams cost essentially nothing. ----
+   if(!g_TimerActive)
+      PanelTick();
+}
+
+//=========================================================================
+//   TIMER: the ONLY dashboard driver in live mode (250-500 ms typical).
+//   The strategy never runs here - OnTick keeps full control of trading.
+//=========================================================================
+void OnTimer()
+{
+   if(!g_InitComplete) return;
+   PanelTick();
+}
+
+//=========================================================================
+//   THROTTLED UI ENTRY POINT  (display only, side-effect free)
+//
+//   - honours DebugMode with a visibility latch: when the panel is turned
+//     off its objects are removed exactly ONCE, never per tick;
+//   - enforces the PanelRefreshMs window with GetTickCount(), which works
+//     identically in live mode and in the Strategy Tester;
+//   - redraws chart annotations only when their dirty flag is set;
+//   - issues at most ONE ChartRedraw() per actual visual change.
+//=========================================================================
+void PanelTick()
+{
+   // ---- visibility latch: create/delete only on a transition ----
+   if(!DebugMode)
+   {
+      if(g_PanelVisible)
+      {
+         ClearPanelObjects();
+         DeleteSRObjects();
+         ObjectsDeleteAll(0,"V13_H1_");
+         ObjectsDeleteAll(0,"V13_M15_");
+         ObjectsDeleteAll(0,"V13_M5_");
+         ObjectsDeleteAll(0,"V13_S");
+         ObjectsDeleteAll(0,"V13_Entry_");
+         ArrayResize(g_EntryMarkerQueue,0);
+         g_HTFVisualDirty=true; g_SRVisualDirty=g_SRActive; g_SetupVisualDirty=true;
+         g_PanelVisible=false;
+         ChartRedraw(0);
+      }
+      return;   // <- nothing else happens while the panel is hidden
+   }
+
+   // ---- time throttle (works in live mode AND in the tester) ----
+   uint now=GetTickCount();
+   uint every=(uint)MathMax(50,MathMin(PanelRefreshMs,5000));
+   if(g_PanelVisible && !g_PanelDirty && (now-g_PanelLastDrawMs)<every)
+      return;
+   g_PanelLastDrawMs=now;
+   g_PanelDirty=false;
+
+   // ---- refresh the cheap decision cache ONCE per render, not per tick ----
+   PanelRefreshStateCache();
+
+   // ---- event-driven chart annotations ----
+   bool visualChanged=UpdateChartVisualsIfDirty();
+
+   // ---- the dashboard itself ----
+   RefreshPanel();
+   g_PanelVisible=true;
+
+   ChartRedraw(0);   // exactly one redraw per throttled update
+   if(visualChanged) { /* already covered by the redraw above */ }
 }
 
 //=========================================================================
@@ -3025,42 +3193,13 @@ void PnHideSurplus()
       PnLabel("R"+IntegerToString(r)+"_0",g_PnRightX,PnRowY(r),"",clrPnDim,g_PnFont);
       PnLabel("RV"+IntegerToString(r),g_PnRightX,PnRowY(r),"",clrPnDim,g_PnFont);
    }
-   // Blank the value labels of the two variable-length right-hand lists.
-   for(int d=g_PnDayCount;d<PN_DAYS;d++)
-      PnLabel("RD"+IntegerToString(d),g_PnRightX,g_PnBodyTop,"",clrPnDim,g_PnFont);
+   // Blank the value labels of the variable-length recent-trade list.
+   // (DAILY PROFIT always renders all PN_DAYS slots, so it needs no blanking.)
    for(int t=g_PnTrCount;t<PN_TRADES;t++)
       PnLabel("RT"+IntegerToString(t),g_PnRightX,g_PnBodyTop,"",clrPnDim,g_PnFont);
 
    g_PnLeftPrev =g_PnLeftUsed;
    g_PnRightPrev=g_PnRightUsed;
-}
-
-//-------------------------------------------------------------------------
-//  Live aggregation of THIS EA's open positions (magic + symbol filtered).
-//  Read-only: mirrors what ManageOpenPositions() sees, changes nothing.
-//-------------------------------------------------------------------------
-void PnCollectOpen(int &total,int &buys,int &sells,double &volume,
-                   double &floatPL,double &avgBuy,double &avgSell)
-{
-   total=0; buys=0; sells=0; volume=0; floatPL=0;
-   double buyVolPrice=0, buyVol=0, sellVolPrice=0, sellVol=0;
-   avgBuy=0; avgSell=0;
-
-   for(int i=PositionsTotal()-1;i>=0;i--)
-   {
-      ulong t=PositionGetTicket(i); if(t==0) continue;
-      if(!PositionIsMine()) continue;
-      double vol=PositionGetDouble(POSITION_VOLUME);
-      double op =PositionGetDouble(POSITION_PRICE_OPEN);
-      double pl =PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP);
-      total++; volume+=vol; floatPL+=pl;
-      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY)
-      { buys++;  buyVol+=vol;  buyVolPrice+=op*vol; }
-      else
-      { sells++; sellVol+=vol; sellVolPrice+=op*vol; }
-   }
-   if(buyVol>0)  avgBuy =buyVolPrice/buyVol;
-   if(sellVol>0) avgSell=sellVolPrice/sellVol;
 }
 
 //-------------------------------------------------------------------------
@@ -3151,12 +3290,120 @@ void PnRebuildHistory()
    g_PnHistoryDirty=false;
 }
 
+//-------------------------------------------------------------------------
+//  INCREMENTAL cache update - called from OnTradeTransaction for each
+//  closed deal of THIS EA. O(1): it shifts the recent-trade ring and adds
+//  the profit to today's bucket. No HistorySelect(), no deal walk, so a
+//  burst of small money-target closes costs essentially nothing.
+//-------------------------------------------------------------------------
+void PnPushClosedTrade(datetime dtime,bool wasBuy,double profit)
+{
+   // recent-trade ring: newest first
+   for(int i=PN_TRADES-1;i>0;i--)
+   {
+      g_PnTrTime[i]=g_PnTrTime[i-1];
+      g_PnTrType[i]=g_PnTrType[i-1];
+      g_PnTrPL[i]  =g_PnTrPL[i-1];
+   }
+   MqlDateTime td; TimeToStruct(dtime,td);
+   g_PnTrTime[0]=StringFormat("%02d/%02d %02d:%02d",td.mon,td.day,td.hour,td.min);
+   g_PnTrType[0]=(wasBuy?"Buy":"Sell");
+   g_PnTrPL[0]  =profit;
+   if(g_PnTrCount<PN_TRADES) g_PnTrCount++;
+
+   // today's bucket + statistics
+   if(g_PnDayCount>0) g_PnDayPL[0]+=profit; else { g_PnDayPL[0]=profit; g_PnDayCount=1; }
+   g_PnDayUsed[0]=true;
+   g_PnTodayTrades++;
+   if(profit>0)      { g_PnTodayWins++;   g_PnTodayWinSum+=profit;  g_PnConsWins++; }
+   else if(profit<0) { g_PnTodayLosses++; g_PnTodayLossSum+=profit; g_PnConsWins=0; }
+}
+
+//-------------------------------------------------------------------------
+//  The expensive full rebuild runs at most once per PanelHistoryRefreshSec
+//  (default 60 s) or when a new day starts. Everything in between is
+//  served from the incremental cache above.
+//-------------------------------------------------------------------------
 void PnMaybeRebuildHistory()
 {
-   int every=MathMax(1,PanelHistoryRefreshSec);
+   int every=MathMax(5,PanelHistoryRefreshSec);
    if(g_PnHistoryDirty || g_PnHistoryLast==0 ||
       (long)TimeCurrent()-(long)g_PnHistoryLast>=every)
       PnRebuildHistory();
+}
+
+//-------------------------------------------------------------------------
+//  DISPLAY STATE CACHE - refreshed once per throttled panel update.
+//  This is the ONLY place where the renderer is allowed to consult the
+//  engine's read-only predicates; the render code itself then reads the
+//  cached values. All of these functions are pure (no state mutation),
+//  so calling them here cannot influence trading in any way.
+//-------------------------------------------------------------------------
+void PanelRefreshStateCache()
+{
+   g_PanelAlignedBias=AlignedBias();
+   g_PanelSpreadOK   =SpreadOK();
+   g_PanelVolOK      =VolOK();
+   g_PanelInSession  =InSession();
+   g_PanelActiveSetups=CountActiveSetups();
+   g_PanelReadySetups =CountReadySetups();
+
+   ENUM_BIAS probe=(g_PanelAlignedBias==ALIGN_BEARISH)?BIAS_BEARISH:BIAS_BULLISH;
+
+   string why="";
+   g_PanelEntryPermission=CheckEntryPermissions(probe,why);
+   g_PanelBlockReason=why;
+
+   g_PanelSRBlocked=false;
+   g_PanelSRReason="";
+   if(g_SRActive)
+   {
+      string srWhy="";
+      g_PanelSRBlocked=SRIsBlockingReadySetup(srWhy);
+      if(!g_PanelSRBlocked)
+         g_PanelSRBlocked=SRBlockReasonForDirection(probe,srWhy);
+      g_PanelSRReason=srWhy;
+   }
+}
+
+//-------------------------------------------------------------------------
+//  EVENT-DRIVEN CHART ANNOTATIONS.
+//  Each family redraws only when its own dirty flag is set, i.e. when a
+//  pivot/zone/setup actually changed. Returns true if anything was drawn.
+//-------------------------------------------------------------------------
+bool UpdateChartVisualsIfDirty()
+{
+   bool changed=false;
+
+   if(g_HTFVisualDirty)
+   {
+      DrawHTFVisuals();
+      g_HTFVisualDirty=false;
+      changed=true;
+   }
+
+   if(g_SRVisualDirty)
+   {
+      DrawSRZones();          // internally a no-op when the module is OFF
+      g_SRVisualDirty=false;
+      changed=true;
+   }
+
+   if(g_SetupVisualDirty)
+   {
+      DrawAllSetupVisuals();
+      g_SetupVisualDirty=false;
+      changed=true;
+   }
+
+   return changed;
+}
+
+// Kept as a named entry point for clarity / future use.
+void UpdateChartVisuals()
+{
+   g_HTFVisualDirty=true; g_SRVisualDirty=g_SRActive; g_SetupVisualDirty=true;
+   UpdateChartVisualsIfDirty();
 }
 
 //-------------------------------------------------------------------------
@@ -3172,9 +3419,10 @@ void PnHeaderStatus(string &txt,color &clr)
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED))
                                                   { txt="DISABLED";   clr=clrPnDim;  return; }
    if(!UseM1)                                     { txt="DISABLED";   clr=clrPnDim;  return; }
-   if(CountPositions()>0)                         { txt="TRADING";    clr=clrPnGood; return; }
-   if(!InSession() || !SpreadOK() || !VolOK())    { txt="WAITING";    clr=clrPnWarn; return; }
-   if(AlignedBias()==ALIGN_CONFLICT)              { txt="WAITING";    clr=clrPnWarn; return; }
+   if(g_PanelOpenTradeCount>0)                    { txt="TRADING";    clr=clrPnGood; return; }
+   if(!g_PanelInSession || !g_PanelSpreadOK || !g_PanelVolOK)
+                                                  { txt="WAITING";    clr=clrPnWarn; return; }
+   if(g_PanelAlignedBias==ALIGN_CONFLICT)         { txt="WAITING";    clr=clrPnWarn; return; }
    if(g_ConsLoss>0)                               { txt="RECOVERING"; clr=clrPnWarn; return; }
    txt="TRADING"; clr=clrPnGood;
 }
@@ -3190,19 +3438,15 @@ void DetermineStatus(string &status,color &clr)
    if(g_HaltedConsec)    { status="BLOCKED (loss streak halt)";    clr=clrPnBad;  return; }
    if(g_HaltedFloat)     { status="BLOCKED (floating loss halt)";  clr=clrPnBad;  return; }
 
-   if(g_SRActive)
-   {
-      string srBlockReason;
-      if(SRIsBlockingReadySetup(srBlockReason))
-      { status="TRADE BLOCKED - "+srBlockReason; clr=clrPnBad; return; }
-   }
+   if(g_SRActive && g_PanelSRBlocked)
+   { status="TRADE BLOCKED - "+g_PanelSRReason; clr=clrPnBad; return; }
 
-   int open=CountPositions();
+   int open=g_PanelOpenTradeCount;
    if(open>0)            { status=StringFormat("ACTIVE (managing %d/%d trades)",open,g_MaxOpenTrades);
                            clr=clrPnGood; return; }
    if(!UseM1)            { status="M1 DISABLED (no new setups; managing only)"; clr=clrPnWarn; return; }
 
-   ENUM_ALIGN_RESULT aligned=AlignedBias();
+   ENUM_ALIGN_RESULT aligned=g_PanelAlignedBias;
    if(aligned!=ALIGN_CONFLICT)
                          { status="ACTIVE (scanning "+AlignResultToStr(aligned)+")"; clr=clrPnGood; return; }
    status="NO NEW SETUPS (HTF conflict)"; clr=clrPnWarn;
@@ -3274,8 +3518,15 @@ void RefreshPanel()
    double mlevel=AccountInfoDouble(ACCOUNT_MARGIN_LEVEL);
    long   lev   =AccountInfoInteger(ACCOUNT_LEVERAGE);
 
-   int    oTotal,oBuys,oSells; double oVol,oFloat,oAvgBuy,oAvgSell;
-   PnCollectOpen(oTotal,oBuys,oSells,oVol,oFloat,oAvgBuy,oAvgSell);
+   // Cached snapshot published by ManageOpenPositions() - the panel does
+   // NOT walk the position list itself.
+   int    oTotal =g_PanelOpenTradeCount;
+   int    oBuys  =g_PanelBuyCount;
+   int    oSells =g_PanelSellCount;
+   double oVol   =g_PanelOpenVolume;
+   double oFloat =g_PanelFloatPL;
+   double oAvgBuy =g_PanelAvgBuy;
+   double oAvgSell=g_PanelAvgSell;
 
    int spreadPts=(int)SymbolInfoInteger(_Symbol,SYMBOL_SPREAD);
 
@@ -3304,7 +3555,7 @@ void RefreshPanel()
                  "Lot Size",  StringFormat("%.2f",g_LotSize), clrPnValue);
    PnLeftKV2(r++,"Free Margin",  StringFormat("%.2f USD",freeM), clrPnValue,
                  "Spread",    StringFormat("%d / %d pts",spreadPts,g_MaxSpreadPoints),
-                 (SpreadOK()?clrPnGood:clrPnBad));
+                 (g_PanelSpreadOK?clrPnGood:clrPnBad));
    PnLeftKV2(r++,"Margin Level", (usedM>0?StringFormat("%.1f %%",mlevel):"--"),
                  (usedM>0 && mlevel<200 ? clrPnWarn : clrPnValue),
                  "Leverage",  StringFormat("1:%d",(int)lev), clrPnValue);
@@ -3325,14 +3576,8 @@ void RefreshPanel()
                  "Consec Losses",  StringFormat("%d",g_ConsLoss),
                  (g_ConsLoss>0?clrPnWarn:clrPnGood));
    string permTxt; color permClr;
-   {
-      string why;
-      // Read-only permission probe using the direction the EA would take.
-      ENUM_ALIGN_RESULT al=AlignedBias();
-      ENUM_BIAS probe=(al==ALIGN_BEARISH)?BIAS_BEARISH:BIAS_BULLISH;
-      if(CheckEntryPermissions(probe,why)) { permTxt="ALLOWED"; permClr=clrPnGood; }
-      else                                  { permTxt=Trunc(why,22); permClr=clrPnBad; }
-   }
+   if(g_PanelEntryPermission) { permTxt="ALLOWED"; permClr=clrPnGood; }
+   else                       { permTxt=Trunc(g_PanelBlockReason,22); permClr=clrPnBad; }
    PnLeftKV2(r++,"Daily Status", (g_HaltedDaily?"HALTED":"NORMAL"),
                  (g_HaltedDaily?clrPnBad:clrPnGood),
                  "Trade Permit", permTxt, permClr);
@@ -3349,7 +3594,7 @@ void RefreshPanel()
       string m15V=UseM15?(g_M15.bias==BIAS_BULLISH?"BULLISH":(g_M15.bias==BIAS_BEARISH?"BEARISH":"NEUTRAL")):"OFF";
       string m5V =UseM5 ?(g_M5.bias==BIAS_BULLISH?"BULLISH":(g_M5.bias==BIAS_BEARISH?"BEARISH":"NEUTRAL")):"OFF";
 
-      ENUM_ALIGN_RESULT al=AlignedBias();
+      ENUM_ALIGN_RESULT al=g_PanelAlignedBias;
       string alV=(al==ALIGN_BULLISH)?"BULLISH":
                  (al==ALIGN_BEARISH)?"BEARISH":
                  (al==ALIGN_NOFILTER)?"NO FILTER":"CONFLICT";
@@ -3407,15 +3652,10 @@ void RefreshPanel()
       for(int i=0;i<g_SRZoneCount && i<SR_MAX_ZONES;i++)
          if(g_SRZones[i].valid && g_SRZones[i].breakCount>confNow) confNow=g_SRZones[i].breakCount;
 
-      // Entry-filter verdict from THE SAME function the entry logic uses.
-      string srWhy; bool srBlocked=SRIsBlockingReadySetup(srWhy);
-      if(!srBlocked)
-      {
-         // No ready setup? Show the verdict for the currently aligned side.
-         ENUM_ALIGN_RESULT al=AlignedBias();
-         ENUM_BIAS probe=(al==ALIGN_BEARISH)?BIAS_BEARISH:BIAS_BULLISH;
-         srBlocked=SRBlockReasonForDirection(probe,srWhy);
-      }
+      // Entry-filter verdict from the cache, which was produced by THE SAME
+      // functions the entry logic uses (see PanelRefreshStateCache).
+      string srWhy=g_PanelSRReason;
+      bool   srBlocked=g_PanelSRBlocked;
 
       PnLeftKV2(r++,"Status",SRStateToStr(g_SRState),
                     (g_SRState==SR_NO_VALID?clrPnDim:clrPnValue),
@@ -3452,7 +3692,7 @@ void RefreshPanel()
       {
          PnLeftKV2(r++,"Current Setup",(UseM1?"NONE":"M1 DISABLED"),
                        (UseM1?clrPnDim:clrPnWarn),
-                       "Active / Ready",StringFormat("%d / %d",CountActiveSetups(),CountReadySetups()),
+                       "Active / Ready",StringFormat("%d / %d",g_PanelActiveSetups,g_PanelReadySetups),
                        clrPnValue);
          PnLeftKV2(r++,"Breakout","--",clrPnDim,"Permission","--",clrPnDim);
       }
@@ -3480,16 +3720,24 @@ void RefreshPanel()
             winTxt=StringFormat("%d bars",(int)(leftSec/60));
          }
 
+         // Cached verdict (computed once per refresh in PanelRefreshStateCache).
          string permTxt2; color permClr2;
-         {
-            string why2;
-            if(CheckEntryPermissions(s.direction,why2)) { permTxt2="ALLOWED"; permClr2=clrPnGood; }
-            else                                         { permTxt2=Trunc(why2,20); permClr2=clrPnBad; }
-         }
+         if(g_PanelEntryPermission) { permTxt2="ALLOWED"; permClr2=clrPnGood; }
+         else                       { permTxt2=Trunc(g_PanelBlockReason,20); permClr2=clrPnBad; }
 
-         PnLeftKV2(r++,"Current Setup",StringFormat("#%d %s (%s)",(int)s.id,stage,dirS),dirC,
-                       "Active / Ready",StringFormat("%d / %d",CountActiveSetups(),CountReadySetups()),
+         string aTxt=(s.A>0)?DoubleToString(s.A,_Digits):"--";
+         string bTxt=(s.B>0)?DoubleToString(s.B,_Digits):"--";
+         string cTxt=(s.C>0)?DoubleToString(s.C,_Digits):"--";
+         string tTxt=(s.trigger>0)?DoubleToString(s.trigger,_Digits):"--";
+
+         PnLeftKV2(r++,"ID / Direction",StringFormat("#%d  %s",(int)s.id,dirS),dirC,
+                       "Active / Ready",StringFormat("%d / %d",g_PanelActiveSetups,g_PanelReadySetups),
                        clrPnValue);
+         PnLeftKV2(r++,"Stage",stage,dirC,
+                       "Validity",(s.active?"VALID":"RETIRED"),(s.active?clrPnGood:clrPnDim));
+         PnLeftKV2(r++,"A",aTxt,clrPnValue,"B",bTxt,clrPnValue);
+         PnLeftKV2(r++,"C",cTxt,clrPnValue,"Trigger",tTxt,
+                       (s.trigger>0?clrPnWarn:clrPnDim));
          PnLeftKV2(r++,"Breakout",boTxt,boClr,
                        "Quality",s.breakoutQuality,
                        (s.breakoutQuality=="PASS"?clrPnGood:
@@ -3497,15 +3745,53 @@ void RefreshPanel()
          PnLeftKV2(r++,"Pullback",(s.pullbackDistance>0?DoubleToString(s.pullbackDistance,2):"--"),
                        clrPnValue,
                        "Entry Window",winTxt,clrPnValue);
-         PnLeftKV2(r++,"Validity",(s.active?"VALID":"RETIRED"),(s.active?clrPnGood:clrPnDim),
-                       "Permission",permTxt2,permClr2);
+         PnLeftKV2(r++,"Permission",permTxt2,permClr2,"","",clrPnDim);
          if(s.entryStatus=="BLOCKED" && s.blockReason!="")
             PnLeftKV2(r++,"Block Reason",Trunc(s.blockReason,24),clrPnBad,"","",clrPnDim);
       }
    }
    r++;
 
-   // ---- G. TODAY'S REPORT ----
+   // ---- G. SYSTEM STATS (engine / execution diagnostics) ----
+   PnLeftSection(r++,"SYSTEM STATS");
+   {
+      PnLeftKV2(r++,"Pivots H / L",StringFormat("%d / %d",g_Cnt_M1PivotHigh,g_Cnt_M1PivotLow),clrPnValue,
+                    "Triggers",StringFormat("%d",g_Cnt_Triggers),clrPnValue);
+      PnLeftKV2(r++,"Setups Created",StringFormat("%d",g_Cnt_SetupsCreated),clrPnValue,
+                    "Active Now",StringFormat("%d",g_PanelActiveSetups),clrPnValue);
+      PnLeftKV2(r++,"Invalid / Exp",StringFormat("%d / %d",g_Cnt_SetupsInvalidated,g_Cnt_SetupsExpired),
+                    clrPnValue,
+                    "Cap Skipped",StringFormat("%d",g_Cnt_SetupsSkippedCap),
+                    (g_Cnt_SetupsSkippedCap>0?clrPnWarn:clrPnValue));
+      PnLeftKV2(r++,"Breakouts",StringFormat("%d",g_Cnt_Breakouts),clrPnValue,
+                    "Qual P / W",StringFormat("%d / %d",g_Cnt_BOQualityPass,g_Cnt_BOQualityWeak),
+                    clrPnValue);
+      PnLeftKV2(r++,"Entries",StringFormat("%d / %d attempts",g_Cnt_EntryExecuted,g_Cnt_EntryAttempts),
+                    (g_Cnt_EntryExecuted>0?clrPnGood:clrPnValue),
+                    "Blocked / Fail",StringFormat("%d / %d",g_Cnt_EntryBlocked,g_Cnt_EntryFailed),
+                    ((g_Cnt_EntryBlocked+g_Cnt_EntryFailed)>0?clrPnWarn:clrPnValue));
+      int rejTotal=g_Cnt_RejectLot+g_Cnt_RejectStops+g_Cnt_RejectMargin+
+                   g_Cnt_RejectFilling+g_Cnt_RejectBroker+g_Cnt_RejectOther;
+      PnLeftKV2(r++,"Rejected",StringFormat("%d",rejTotal),(rejTotal>0?clrPnBad:clrPnGood),
+                    "Long / Short",StringFormat("%d / %d",g_LongTrades,g_ShortTrades),clrPnValue);
+      if(rejTotal>0)
+         PnLeftKV2(r++,"Rej L/S/M",StringFormat("%d/%d/%d",g_Cnt_RejectLot,g_Cnt_RejectStops,g_Cnt_RejectMargin),
+                       clrPnBad,
+                       "Rej F/B/O",StringFormat("%d/%d/%d",g_Cnt_RejectFilling,g_Cnt_RejectBroker,g_Cnt_RejectOther),
+                       clrPnBad);
+      double avgHold=(g_Cnt_TargetCloses>0)?g_SumTargetHoldSec/g_Cnt_TargetCloses:0.0;
+      double avgMae =(g_Cnt_TargetCloses>0)?g_SumMAE/g_Cnt_TargetCloses:0.0;
+      PnLeftKV2(r++,"Target Closes",StringFormat("%d",g_Cnt_TargetCloses),
+                    (g_Cnt_TargetCloses>0?clrPnGood:clrPnValue),
+                    "Target Profit",StringFormat("%.2f USD",g_SumTargetProfit),
+                    (g_SumTargetProfit>0?clrPnGood:clrPnValue));
+      PnLeftKV2(r++,"Avg Hold",(g_Cnt_TargetCloses>0?StringFormat("%.0f sec",avgHold):"--"),clrPnValue,
+                    "Avg MAE",(g_Cnt_TargetCloses>0?StringFormat("%.2f USD",avgMae):"--"),
+                    (avgMae>0?clrPnWarn:clrPnValue));
+   }
+   r++;
+
+   // ---- H. TODAY'S REPORT ----
    PnLeftSection(r++,"TODAY'S REPORT");
    {
       double todayNet=g_PnTodayWinSum+g_PnTodayLossSum;
@@ -3572,18 +3858,27 @@ void RefreshPanel()
 
    // ---- B. DAILY PROFIT HISTORY ----
    PnRightSection(rr++,"DAILY PROFIT");
-   if(g_PnDayCount<=0)
-      PnRightRaw(rr++,0,"  No historical data",clrPnDim);
-   else
    {
+      // Always render all PN_DAYS slots. A day with no EA trades shows a
+      // real zero; a day with no data at all shows "--" (never fabricated).
       for(int d=0;d<PN_DAYS;d++)
       {
-         if(!g_PnDayUsed[d]) continue;
-         double v=g_PnDayPL[d];
-         string pctTxt=(bal-v!=0.0)?StringFormat("(%.2f%%)",100.0*v/MathMax(0.01,bal-v)):"";
-         PnRightRaw(rr,0,PnPad(g_PnDayLabel[d],8),clrPnLabel);
-         PnLabel("RD"+IntegerToString(d),g_PnRightX+PnTextW(9),PnRowY(rr),
-                 StringFormat("%+8.2f USD  %s",v,pctTxt),PnPLColor(v),g_PnFont);
+         string lbl=(g_PnDayLabel[d]!="")?g_PnDayLabel[d]:"--";
+         PnRightRaw(rr,0,PnPad(lbl,8),clrPnLabel);
+         string vTxt; color vClr;
+         if(!g_PnDayUsed[d])
+         {
+            vTxt="      --"; vClr=clrPnDim;
+         }
+         else
+         {
+            double v=g_PnDayPL[d];
+            double refBal=bal-v;
+            string pctTxt=(refBal>0.0)?StringFormat("(%.2f%%)",100.0*v/refBal):"";
+            vTxt=StringFormat("%+8.2f USD  %s",v,pctTxt);
+            vClr=PnPLColor(v);
+         }
+         PnLabel("RD"+IntegerToString(d),g_PnRightX+PnTextW(9),PnRowY(rr),vTxt,vClr,g_PnFont);
          rr++;
       }
    }
@@ -3645,11 +3940,8 @@ void RefreshPanel()
    }
 
    PnHideSurplus();
-
-   // Existing chart annotations are unchanged.
-   DrawHTFVisuals();
-   DrawAllSetupVisuals();
-
-   ChartRedraw(0);
+   // NOTE: no DrawHTFVisuals()/DrawAllSetupVisuals()/ChartRedraw() here.
+   // Chart annotations are event-driven (UpdateChartVisualsIfDirty) and the
+   // single redraw is issued by PanelTick().
 }
 //+------------------------------------------------------------------+
