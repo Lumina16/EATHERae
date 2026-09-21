@@ -122,9 +122,9 @@ input int    MaxSlippagePoints = 30;
 input group "PANEL (DISPLAY ONLY)"
 input int    PanelX                 = 10;    // panel left offset (px)
 input int    PanelY                 = 18;    // panel top offset (px)
-input int    PanelWidth             = 900;   // total panel width (px)
+input int    PanelWidth             = 1000;  // total panel width (px, 900-1050)
 input int    PanelMinHeight         = 0;     // 0 = auto height
-input int    PanelRowHeight         = 14;    // row pitch (px)
+input int    PanelRowHeight         = 15;    // row pitch (px)
 input int    PanelFontSize          = 8;     // body font size
 input int    PanelRefreshMs         = 300;   // dashboard refresh throttle (ms)
 input int    PanelHistoryRefreshSec = 60;    // FULL history re-scan interval (s)
@@ -2729,6 +2729,7 @@ void DrawHTFMarker(string prefix,string tag,double price,datetime time,color clr
    ObjectSetInteger(0,name,OBJPROP_ARROWCODE,arrowCode);
    ObjectSetInteger(0,name,OBJPROP_COLOR,clr);
    ObjectSetInteger(0,name,OBJPROP_WIDTH,1);
+   ObjectSetInteger(0,name,OBJPROP_BACK,true);   // behind the opaque panel
 
    string label=name+"_txt";
    if(ObjectFind(0,label)<0)
@@ -2738,6 +2739,7 @@ void DrawHTFMarker(string prefix,string tag,double price,datetime time,color clr
    ObjectSetString(0,label,OBJPROP_TEXT," "+tag);
    ObjectSetInteger(0,label,OBJPROP_COLOR,clr);
    ObjectSetInteger(0,label,OBJPROP_FONTSIZE,fontSize);
+   ObjectSetInteger(0,label,OBJPROP_BACK,true);
 }
 
 void DrawTFMarkers(string prefix,TFStruct &st,color highClr,color lowClr)
@@ -2815,6 +2817,7 @@ void DrawSetupAnchor(int id,string tag,double price,datetime time,color clr,int 
    ObjectSetInteger(0,name,OBJPROP_ARROWCODE,arrowCode);
    ObjectSetInteger(0,name,OBJPROP_COLOR,clr);
    ObjectSetInteger(0,name,OBJPROP_WIDTH,2);
+   ObjectSetInteger(0,name,OBJPROP_BACK,true);   // behind the opaque panel
 
    string label=name+"_txt";
    if(ObjectFind(0,label)<0)
@@ -2824,6 +2827,7 @@ void DrawSetupAnchor(int id,string tag,double price,datetime time,color clr,int 
    ObjectSetString(0,label,OBJPROP_TEXT,StringFormat(" #%d %s",id,tag));
    ObjectSetInteger(0,label,OBJPROP_COLOR,clr);
    ObjectSetInteger(0,label,OBJPROP_FONTSIZE,8);
+   ObjectSetInteger(0,label,OBJPROP_BACK,true);
 }
 
 void DrawSetupTrigger(int id,double price,datetime fromTime,color clr)
@@ -2842,6 +2846,7 @@ void DrawSetupTrigger(int id,double price,datetime fromTime,color clr)
    ObjectSetInteger(0,name,OBJPROP_STYLE,STYLE_DASH);
    ObjectSetInteger(0,name,OBJPROP_WIDTH,2);
    ObjectSetInteger(0,name,OBJPROP_RAY_RIGHT,true);
+   ObjectSetInteger(0,name,OBJPROP_BACK,true);   // behind the opaque panel
 
    string label=name+"_txt";
    if(ObjectFind(0,label)<0)
@@ -2851,6 +2856,7 @@ void DrawSetupTrigger(int id,double price,datetime fromTime,color clr)
    ObjectSetString(0,label,OBJPROP_TEXT,StringFormat(" #%d TRIGGER",id));
    ObjectSetInteger(0,label,OBJPROP_COLOR,clr);
    ObjectSetInteger(0,label,OBJPROP_FONTSIZE,8);
+   ObjectSetInteger(0,label,OBJPROP_BACK,true);
 }
 
 void DeleteSetupTrigger(int id)
@@ -2918,6 +2924,7 @@ void DrawEntryMarker(ENUM_ORDER_TYPE ot,double price,datetime time,int setupId)
    ObjectSetInteger(0,name,OBJPROP_ARROWCODE,code);
    ObjectSetInteger(0,name,OBJPROP_COLOR,clr);
    ObjectSetInteger(0,name,OBJPROP_WIDTH,3);
+   ObjectSetInteger(0,name,OBJPROP_BACK,true);   // behind the opaque panel
 
    string label=name+"_txt";
    if(ObjectCreate(0,label,OBJ_TEXT,0,time,price))
@@ -2925,6 +2932,7 @@ void DrawEntryMarker(ENUM_ORDER_TYPE ot,double price,datetime time,int setupId)
       ObjectSetString(0,label,OBJPROP_TEXT,StringFormat("%s #%d",(ot==ORDER_TYPE_BUY?" BUY":" SELL"),setupId));
       ObjectSetInteger(0,label,OBJPROP_COLOR,clr);
       ObjectSetInteger(0,label,OBJPROP_FONTSIZE,9);
+      ObjectSetInteger(0,label,OBJPROP_BACK,true);
    }
 
    AddEntryMarkerToQueue(name);
@@ -2957,6 +2965,7 @@ void DrawEntryMarker(ENUM_ORDER_TYPE ot,double price,datetime time,int setupId)
 #define PN_PREFIX "V13_P_"
 
 // ---- forward declarations (MQL5 requires declaration before use) ----
+double PnCharW();
 int    PnTextW(int chars);
 void   PnLabel(string id,int x,int y,string text,color clr,int fontSize,string font="Consolas");
 void   PnRect(string id,int x,int y,int w,int h,color border,color bg,int zorder,bool back);
@@ -2971,6 +2980,14 @@ void   PnRebuildHistory();
 int  g_PnX=0, g_PnY=0, g_PnW=0, g_PnH=0;
 int  g_PnRowH=0, g_PnFont=0;
 int  g_PnLeftX=0, g_PnRightX=0, g_PnSepX=0, g_PnColW=0;
+// Four computed field zones for the left column (label|value|label|value)
+// and two for the right column. All derived from PanelWidth / PanelFontSize
+// at render time, so the layout adapts instead of relying on magic offsets.
+int  g_PnZ1=0, g_PnZ2=0, g_PnZ3=0, g_PnZ4=0;   // left col field origins (px)
+int  g_PnZ1W=0, g_PnZ2W=0, g_PnZ3W=0, g_PnZ4W=0; // field widths in CHARACTERS
+int  g_PnRZ1=0, g_PnRZ2=0;                     // right col label/value origins
+int  g_PnRZ1W=0, g_PnRZ2W=0;
+int  g_PnLeftCols=0, g_PnRightCols=0;          // section-rule widths (chars)
 int  g_PnBodyTop=0, g_PnFooterY=0;
 
 // ---- Dashboard colour scheme (dark navy HUD) ----
@@ -3041,6 +3058,20 @@ color PnPLColor(double v)
    if(v>0) return clrPnGood;
    if(v<0) return clrPnBad;
    return clrPnValue;
+}
+
+// Right-align a string inside a fixed character width (numeric columns).
+string PnPadLeft(string s,int width)
+{
+   int n=StringLen(s);
+   if(n>=width)
+   {
+      if(width<4) return StringSubstr(s,0,width);
+      return StringSubstr(s,0,width-1)+".";
+   }
+   string out="";
+   for(int i=n;i<width;i++) out+=" ";
+   return out+s;
 }
 
 string PnPad(string s,int width)
@@ -3142,9 +3173,15 @@ string PnSectionText(string title,int width)
 //-------------------------------------------------------------------------
 void PnEnsureChrome()
 {
-   // Provisional geometry; the final size is applied at the end of
-   // RefreshPanel() once the real row count is known.
-   PnRect("BG",     g_PnX,   g_PnY,   g_PnW, MathMax(40,g_PnH), clrPnBorder, clrPnBG,  0, true);
+   // The pane is OPAQUE and lives in the FOREGROUND (OBJPROP_BACK=false)
+   // so candles, HTF markers, A/B/C/TRIGGER anchors, entry arrows and S/R
+   // rectangles are all hidden wherever they fall under the dashboard.
+   // Those chart annotations are themselves flagged OBJPROP_BACK=true, so
+   // they stay in the chart background layer and remain fully visible
+   // OUTSIDE the panel - nothing is ever deleted to achieve this.
+   // Creating the pane BEFORE any label guarantees the labels (also
+   // foreground) paint on top of it.
+   PnRect("BG",     g_PnX,   g_PnY,   g_PnW, MathMax(40,g_PnH), clrPnBorder, clrPnBG,  0, false);
    PnRect("HdrLine",g_PnX+4, g_PnY+1, g_PnW-8, 1, clrPnBorder, clrPnBorder, 2, false);
    PnRect("Sep",    g_PnSepX,g_PnY+1, 1,       1, clrPnSep,    clrPnSep,    2, false);
    PnRect("FtLine", g_PnX+4, g_PnY+1, g_PnW-8, 1, clrPnBorder, clrPnBorder, 2, false);
@@ -3172,37 +3209,59 @@ void PnRightRaw(int row,int xOffset,string text,color clr)
 }
 
 // Section header row
-void PnLeftSection(int row,string title)  { PnLeftRaw(row,0,PnSectionText(title,52),clrPnSection); }
-void PnRightSection(int row,string title) { PnRightRaw(row,0,PnSectionText(title,46),clrPnSection); }
+void PnLeftSection(int row,string title)  { PnLeftRaw(row,0,PnSectionText(title,g_PnLeftCols),clrPnSection); }
+void PnRightSection(int row,string title) { PnRightRaw(row,0,PnSectionText(title,g_PnRightCols),clrPnSection); }
 
-// Two key/value pairs side by side on one row (left column only).
+//-------------------------------------------------------------------------
+//  FOUR-ZONE LEFT ROW:   [label1][value1]   [label2][value2]
+//  Each zone has a computed pixel origin AND a character budget, so a long
+//  value is truncated inside its own zone and can never touch the next
+//  field or cross the divider.
+//
+//  Pass l2=="" for a wide single-pair row: value1 then gets the combined
+//  width of zones 2..4, which is how long texts such as
+//  "Breaking Resistance" or a block reason are displayed without squeezing.
+//-------------------------------------------------------------------------
 void PnLeftKV2(int row,string l1,string v1,color c1,string l2,string v2,color c2)
 {
-   PnLeftRaw(row,0,PnPad(l1,15)+":",clrPnLabel);
-   PnLabel("LA"+IntegerToString(row),g_PnLeftX+PnTextW(17),PnRowY(row),v1,c1,g_PnFont);
+   PnLeftRaw(row,0,PnPad(l1,g_PnZ1W),clrPnLabel);
+
    if(l2!="")
    {
-      PnLeftRaw(row,PnTextW(29),PnPad(l2,15)+":",clrPnLabel);
-      PnLabel("LB"+IntegerToString(row),g_PnLeftX+PnTextW(47),PnRowY(row),v2,c2,g_PnFont);
+      PnLabel("LA"+IntegerToString(row),g_PnLeftX+g_PnZ2,PnRowY(row),
+              PnPad(v1,g_PnZ2W),c1,g_PnFont);
+      PnLeftRaw(row,g_PnZ3,PnPad(l2,g_PnZ3W),clrPnLabel);
+      PnLabel("LB"+IntegerToString(row),g_PnLeftX+g_PnZ4,PnRowY(row),
+              PnPad(v2,g_PnZ4W),c2,g_PnFont);
    }
    else
    {
-      PnLeftRaw(row,PnTextW(29),"",clrPnLabel);
-      PnLabel("LB"+IntegerToString(row),g_PnLeftX+PnTextW(47),PnRowY(row),"",clrPnLabel,g_PnFont);
+      // wide value: zones 2+3+4 merged
+      PnLabel("LA"+IntegerToString(row),g_PnLeftX+g_PnZ2,PnRowY(row),
+              PnPad(v1,g_PnZ2W+g_PnZ3W+g_PnZ4W),c1,g_PnFont);
+      PnLeftRaw(row,g_PnZ3,"",clrPnLabel);
+      PnLabel("LB"+IntegerToString(row),g_PnLeftX+g_PnZ4,PnRowY(row),"",clrPnLabel,g_PnFont);
    }
 }
 
+//  RIGHT ROW: [label][value]  - same computed-zone principle.
 void PnRightKV(int row,string label,string value,color vClr)
 {
-   PnRightRaw(row,0,PnPad(label,14)+":",clrPnLabel);
-   PnLabel("RV"+IntegerToString(row),g_PnRightX+PnTextW(16),PnRowY(row),value,vClr,g_PnFont);
+   PnRightRaw(row,0,PnPad(label,g_PnRZ1W),clrPnLabel);
+   PnLabel("RV"+IntegerToString(row),g_PnRightX+g_PnRZ2,PnRowY(row),
+           PnPad(value,g_PnRZ2W),vClr,g_PnFont);
 }
 
-// Approximate monospace advance width for the configured font size.
+// Monospace advance width (px per character) for the configured font size.
+double PnCharW()
+{
+   return g_PnFont*0.62+0.85;        // Consolas ~0.6em advance
+}
+
+// Approximate pixel width of N monospace characters.
 int PnTextW(int chars)
 {
-   double per=g_PnFont*0.62+0.8;     // Consolas ~0.6em advance
-   return (int)MathRound(chars*per);
+   return (int)MathRound(chars*PnCharW());
 }
 
 // Hide (blank) any pooled row that the current frame no longer uses.
@@ -3547,13 +3606,47 @@ void RefreshPanel()
    g_PnRowH=MathMax(g_PnFont+3,PanelRowHeight);
    g_PnW   =MathMax(560,PanelWidth);
 
-   int pad=10;
+   int pad=12;
    g_PnColW  =(g_PnW-pad*3)/2;
    g_PnLeftX =g_PnX+pad;
    g_PnSepX  =g_PnX+pad+g_PnColW+pad/2;
-   g_PnRightX=g_PnSepX+pad/2+pad/2;
+   g_PnRightX=g_PnSepX+pad;
 
-   int headerH=g_PnRowH+10;
+   //---------------------------------------------------------------------
+   //  COMPUTED FIELD ZONES (replaces the old hard-coded PnTextW(17/29/47)
+   //  offsets). Everything below is derived from the column width and the
+   //  current font, so the layout stays correct when PanelWidth or
+   //  PanelFontSize change.
+   //
+   //     |<-- Z1 label -->|<-- Z2 value -->|<-- Z3 label -->|<-- Z4 value -->|
+   //---------------------------------------------------------------------
+   int colChars=(int)MathFloor((double)(g_PnColW-pad)/PnCharW());
+   if(colChars<40) colChars=40;
+   g_PnLeftCols=colChars;
+
+   int gapChars=2;                                  // guaranteed gap between fields
+   int pairChars=(colChars-gapChars)/2;             // width of one label+value pair
+   g_PnZ1W=(int)MathMax(12,MathRound(pairChars*0.55))-1;   // label 1
+   g_PnZ2W=pairChars-g_PnZ1W-1;                            // value 1
+   g_PnZ3W=g_PnZ1W;                                        // label 2
+   g_PnZ4W=colChars-(g_PnZ1W+g_PnZ2W+1+gapChars)-g_PnZ3W;  // value 2
+   if(g_PnZ4W<8) g_PnZ4W=8;
+
+   g_PnZ1=0;
+   g_PnZ2=PnTextW(g_PnZ1W);
+   g_PnZ3=PnTextW(g_PnZ1W+g_PnZ2W+gapChars);
+   g_PnZ4=PnTextW(g_PnZ1W+g_PnZ2W+gapChars+g_PnZ3W);
+
+   int rColChars=(int)MathFloor((double)(g_PnColW-pad)/PnCharW());
+   if(rColChars<34) rColChars=34;
+   g_PnRightCols=rColChars;
+   g_PnRZ1W=(int)MathMax(12,MathRound(rColChars*0.42));
+   g_PnRZ2W=rColChars-g_PnRZ1W-1;
+   if(g_PnRZ2W<10) g_PnRZ2W=10;
+   g_PnRZ1=0;
+   g_PnRZ2=PnTextW(g_PnRZ1W+1);
+
+   int headerH=g_PnRowH+12;
    g_PnBodyTop=g_PnY+headerH+6;
 
    // >>> CHROME FIRST: the background pane and the rules must exist before
@@ -3591,12 +3684,21 @@ void RefreshPanel()
    int totalRows=0;   // computed after the columns are built
    // (the background is sized at the end - create it first at z-order 0)
 
-   PnLabel("HdrName",g_PnLeftX,g_PnY+5,
-           "XAUUSD_TrendContinuation_V13 | v13.4",clrPnTitle,g_PnFont+2);
-   PnLabel("HdrSym",g_PnX+g_PnW/2,g_PnY+5,
-           _Symbol+"  "+PnTFName(_Period),clrPnValue,g_PnFont+2);
-   // Status lamp stays in the FOREGROUND (labels are never OBJPROP_BACK).
-   PnLabel("HdrStat",g_PnX+g_PnW-PnTextW(15),g_PnY+5,stTxt+"  "+ShortToString(0x25CF),stClr,g_PnFont+2);
+   // Three clearly separated header regions: name (left), symbol+TF
+   // (centred), status lamp (right-aligned inside the pane).
+   int hdrY=g_PnY+6;
+   string hdrSym=_Symbol+"   "+PnTFName(_Period);
+   string hdrStat=stTxt+"  "+ShortToString(0x25CF);
+   int hdrFont=g_PnFont+2;
+   double hdrCharW=hdrFont*0.62+0.85;
+   int symX =g_PnX+(g_PnW-(int)MathRound(StringLen(hdrSym)*hdrCharW))/2;
+   int statX=g_PnX+g_PnW-12-(int)MathRound(StringLen(hdrStat)*hdrCharW);
+
+   PnLabel("HdrName",g_PnLeftX,hdrY,
+           "XAUUSD_TrendContinuation_V13 | v13.4",clrPnTitle,hdrFont);
+   PnLabel("HdrSym",symX,hdrY,hdrSym,clrPnValue,hdrFont);
+   // Status lamp is a foreground label -> always above the opaque pane.
+   PnLabel("HdrStat",statX,hdrY,hdrStat,stClr,hdrFont);
 
    //=======================  LEFT COLUMN  ===============================
    int r=0;
@@ -3633,10 +3735,10 @@ void RefreshPanel()
                  (g_ConsLoss>0?clrPnWarn:clrPnGood));
    string permTxt; color permClr;
    if(g_PanelEntryPermission) { permTxt="ALLOWED"; permClr=clrPnGood; }
-   else                       { permTxt=Trunc(g_PanelBlockReason,22); permClr=clrPnBad; }
+   else                       { permTxt=g_PanelBlockReason; permClr=clrPnBad; }
    PnLeftKV2(r++,"Daily Status", (g_HaltedDaily?"HALTED":"NORMAL"),
-                 (g_HaltedDaily?clrPnBad:clrPnGood),
-                 "Trade Permit", permTxt, permClr);
+                 (g_HaltedDaily?clrPnBad:clrPnGood),"","",clrPnDim);
+   PnLeftKV2(r++,"Trade Permit", permTxt, permClr, "","",clrPnDim);   // wide row
    r++;
 
    // ---- C. MULTI-TIMEFRAME BIAS ----
@@ -3713,17 +3815,18 @@ void RefreshPanel()
       string srWhy=g_PanelSRReason;
       bool   srBlocked=g_PanelSRBlocked;
 
+      // Long state strings ("Breaking Resistance") get the wide row form.
       PnLeftKV2(r++,"Status",SRStateToStr(g_SRState),
-                    (g_SRState==SR_NO_VALID?clrPnDim:clrPnValue),
-                    "Entry Filter",(srBlocked?"BLOCKED":"ALLOWED"),
-                    (srBlocked?clrPnBad:clrPnGood));
+                    (g_SRState==SR_NO_VALID?clrPnDim:clrPnValue),"","",clrPnDim);
+      PnLeftKV2(r++,"Entry Filter",(srBlocked?"BLOCKED":"ALLOWED"),
+                    (srBlocked?clrPnBad:clrPnGood),
+                    "Zones",StringFormat("%d / %d",g_SRZoneCount,SR_MAX_ZONES),clrPnValue);
       PnLeftKV2(r++,"Nearest Zone",zoneTxt,clrPnValue,
                     "Direction",dirTxt,dirClr);
       PnLeftKV2(r++,"Confirmation",StringFormat("%d / %d",confNow,g_SRBreakConfirmBars),
-                    (confNow>0?clrPnWarn:clrPnValue),
-                    "Zones",StringFormat("%d / %d",g_SRZoneCount,SR_MAX_ZONES),clrPnValue);
+                    (confNow>0?clrPnWarn:clrPnValue),"","",clrPnDim);
       if(srBlocked && srWhy!="")
-         PnLeftKV2(r++,"Block Reason",Trunc(srWhy,24),clrPnBad,"","",clrPnDim);
+         PnLeftKV2(r++,"Block Reason",srWhy,clrPnBad,"","",clrPnDim);   // wide row
    }
    r++;
 
@@ -3779,7 +3882,7 @@ void RefreshPanel()
          // Cached verdict (computed once per refresh in PanelRefreshStateCache).
          string permTxt2; color permClr2;
          if(g_PanelEntryPermission) { permTxt2="ALLOWED"; permClr2=clrPnGood; }
-         else                       { permTxt2=Trunc(g_PanelBlockReason,20); permClr2=clrPnBad; }
+         else                       { permTxt2=g_PanelBlockReason; permClr2=clrPnBad; }
 
          string aTxt=(s.A>0)?DoubleToString(s.A,_Digits):"--";
          string bTxt=(s.B>0)?DoubleToString(s.B,_Digits):"--";
@@ -3801,9 +3904,9 @@ void RefreshPanel()
          PnLeftKV2(r++,"Pullback",(s.pullbackDistance>0?DoubleToString(s.pullbackDistance,2):"--"),
                        clrPnValue,
                        "Entry Window",winTxt,clrPnValue);
-         PnLeftKV2(r++,"Permission",permTxt2,permClr2,"","",clrPnDim);
+         PnLeftKV2(r++,"Permission",permTxt2,permClr2,"","",clrPnDim);   // wide row
          if(s.entryStatus=="BLOCKED" && s.blockReason!="")
-            PnLeftKV2(r++,"Block Reason",Trunc(s.blockReason,24),clrPnBad,"","",clrPnDim);
+            PnLeftKV2(r++,"Block Reason",s.blockReason,clrPnBad,"","",clrPnDim);
       }
    }
    r++;
@@ -3872,7 +3975,7 @@ void RefreshPanel()
                     (g_ConsLoss>0?clrPnBad:clrPnValue));
       color dsClr; string dsTxt=PnDetailStatus(dsClr);
       color mapped=(dsClr==clrPnBad)?clrPnBad:dsClr;
-      PnLeftKV2(r++,"EA Status",Trunc(dsTxt,38),mapped,"","",clrPnDim);
+      PnLeftKV2(r++,"EA Status",dsTxt,mapped,"","",clrPnDim);   // wide row
    }
 
    //=======================  RIGHT COLUMN  ==============================
@@ -3920,21 +4023,21 @@ void RefreshPanel()
       for(int d=0;d<PN_DAYS;d++)
       {
          string lbl=(g_PnDayLabel[d]!="")?g_PnDayLabel[d]:"--";
-         PnRightRaw(rr,0,PnPad(lbl,8),clrPnLabel);
+         PnRightRaw(rr,0,PnPad(lbl,g_PnRZ1W),clrPnLabel);
          string vTxt; color vClr;
          if(!g_PnDayUsed[d])
          {
-            vTxt="      --"; vClr=clrPnDim;
+            vTxt=PnPadLeft("--",g_PnRZ2W); vClr=clrPnDim;
          }
          else
          {
             double v=g_PnDayPL[d];
             double refBal=bal-v;
-            string pctTxt=(refBal>0.0)?StringFormat("(%.2f%%)",100.0*v/refBal):"";
-            vTxt=StringFormat("%+8.2f USD  %s",v,pctTxt);
+            string pctTxt=(refBal>0.0)?StringFormat(" (%.2f%%)",100.0*v/refBal):"";
+            vTxt=PnPadLeft(StringFormat("%+.2f USD%s",v,pctTxt),g_PnRZ2W);
             vClr=PnPLColor(v);
          }
-         PnLabel("RD"+IntegerToString(d),g_PnRightX+PnTextW(9),PnRowY(rr),vTxt,vClr,g_PnFont);
+         PnLabel("RD"+IntegerToString(d),g_PnRightX+g_PnRZ2,PnRowY(rr),vTxt,vClr,g_PnFont);
          rr++;
       }
    }
@@ -3942,19 +4045,33 @@ void RefreshPanel()
 
    // ---- C. RECENT TRADES ----
    PnRightSection(rr++,"RECENT TRADES");
-   PnRightRaw(rr++,0,PnPad("Time",13)+PnPad("Type",6)+PnPad("Result",8)+"P/L",clrPnDim);
-   if(g_PnTrCount<=0)
-      PnRightRaw(rr++,0,"  No closed trades yet",clrPnDim);
-   else
    {
-      for(int t=0;t<g_PnTrCount;t++)
+      // Sub-column budgets derived from the right column width.
+      int wTime=13, wType=6;
+      int wRest=g_PnRightCols-wTime-wType;
+      if(wRest<14) wRest=14;
+      int wRes=7, wPL=wRest-wRes;
+      if(wPL<7) wPL=7;
+      int xRest=PnTextW(wTime+wType);
+
+      PnRightRaw(rr,0,PnPad("Time",wTime)+PnPad("Type",wType),clrPnDim);
+      PnLabel("RTH",g_PnRightX+xRest,PnRowY(rr),
+              PnPad("Result",wRes)+PnPadLeft("P/L",wPL),clrPnDim,g_PnFont);
+      rr++;
+
+      if(g_PnTrCount<=0)
+         PnRightRaw(rr++,0,"  No closed trades yet",clrPnDim);
+      else
       {
-         bool win=(g_PnTrPL[t]>=0);
-         PnRightRaw(rr,0,PnPad(g_PnTrTime[t],13)+PnPad(g_PnTrType[t],6),clrPnValue);
-         PnLabel("RT"+IntegerToString(t),g_PnRightX+PnTextW(19),PnRowY(rr),
-                 PnPad(win?"WIN":"LOSS",8)+StringFormat("%+.2f",g_PnTrPL[t]),
-                 (win?clrPnGood:clrPnBad),g_PnFont);
-         rr++;
+         for(int t=0;t<g_PnTrCount;t++)
+         {
+            bool win=(g_PnTrPL[t]>=0);
+            PnRightRaw(rr,0,PnPad(g_PnTrTime[t],wTime)+PnPad(g_PnTrType[t],wType),clrPnValue);
+            PnLabel("RT"+IntegerToString(t),g_PnRightX+xRest,PnRowY(rr),
+                    PnPad(win?"WIN":"LOSS",wRes)+PnPadLeft(StringFormat("%+.2f",g_PnTrPL[t]),wPL),
+                    (win?clrPnGood:clrPnBad),g_PnFont);
+            rr++;
+         }
       }
    }
 
@@ -3971,7 +4088,7 @@ void RefreshPanel()
    // Re-apply the real geometry to the persistent chrome objects (they
    // already exist - this only updates position/size, never recreates).
    PnRect("BG",     g_PnX,    g_PnY,          g_PnW,   g_PnH,
-          clrPnBorder, clrPnBG, 0, true);                       // BACKGROUND layer
+          clrPnBorder, clrPnBG, 0, false);        // opaque FOREGROUND pane
    PnRect("HdrLine",g_PnX+4,  g_PnY+headerH,  g_PnW-8, 1,
           clrPnBorder, clrPnBorder, 2, false);
    // divider runs from just under the header rule to just above the footer
@@ -3995,14 +4112,24 @@ void RefreshPanel()
       string conn=connected?"CONNECTED":"NO CONNECTION";
       color  connClr=connected?clrPnGood:clrPnBad;
 
-      int fy=g_PnFooterY+5;
-      PnLabel("Ft1",g_PnLeftX,fy,TimeToString(lt,TIME_DATE|TIME_SECONDS),clrPnValue,g_PnFont);
-      PnLabel("Ft2",g_PnLeftX+PnTextW(22),fy,"| "+nextAction,clrPnWarn,g_PnFont);
-      PnLabel("Ft3",g_PnLeftX+PnTextW(52),fy,
-              "| Server: "+TimeToString(st,TIME_SECONDS),clrPnValue,g_PnFont);
-      PnLabel("Ft4",g_PnLeftX+PnTextW(72),fy,
-              "| "+AccountInfoString(ACCOUNT_SERVER),clrPnLabel,g_PnFont);
-      PnLabel("Ft5",g_PnLeftX+PnTextW(95),fy,"| "+conn,connClr,g_PnFont);
+      // Sequential cursor: each segment is placed after the measured width
+      // of the previous one, so footer fields can never collide whatever
+      // the broker name length or font size.
+      int fy=g_PnFooterY+6;
+      string f1=TimeToString(lt,TIME_DATE|TIME_SECONDS);
+      string f2="|  "+nextAction;
+      string f3="|  Server: "+TimeToString(st,TIME_SECONDS);
+      string f4="|  "+AccountInfoString(ACCOUNT_SERVER);
+      string f5="|  "+conn;
+
+      int fx=g_PnLeftX;
+      PnLabel("Ft1",fx,fy,f1,clrPnValue,g_PnFont); fx+=PnTextW(StringLen(f1)+3);
+      PnLabel("Ft2",fx,fy,f2,clrPnWarn, g_PnFont); fx+=PnTextW(StringLen(f2)+3);
+      PnLabel("Ft3",fx,fy,f3,clrPnValue,g_PnFont); fx+=PnTextW(StringLen(f3)+3);
+      PnLabel("Ft4",fx,fy,f4,clrPnLabel,g_PnFont); fx+=PnTextW(StringLen(f4)+3);
+      // Last segment is clamped so it always stays inside the pane.
+      int f5x=MathMin(fx,g_PnX+g_PnW-12-PnTextW(StringLen(f5)));
+      PnLabel("Ft5",f5x,fy,f5,connClr,g_PnFont);
    }
 
    PnHideSurplus();
