@@ -399,6 +399,7 @@ void   PnPushClosedTrade(datetime dtime,bool wasBuy,double profit);
 void   UpdateChartVisuals();
 bool   UpdateChartVisualsIfDirty();
 void   PanelRefreshStateCache();
+void   PnEnsureChrome();
 void   PanelTick();
 void   PrintBacktestSummary();
 void   FeedPivotBullish(int idx,ENUM_SWING_TYPE type,double price,datetime time,double atrM1);
@@ -2958,7 +2959,7 @@ void DrawEntryMarker(ENUM_ORDER_TYPE ot,double price,datetime time,int setupId)
 // ---- forward declarations (MQL5 requires declaration before use) ----
 int    PnTextW(int chars);
 void   PnLabel(string id,int x,int y,string text,color clr,int fontSize,string font="Consolas");
-void   PnRect(string id,int x,int y,int w,int h,color border,color bg,int zorder);
+void   PnRect(string id,int x,int y,int w,int h,color border,color bg,int zorder,bool back);
 void   PnLeftRaw(int row,int xOffset,string text,color clr);
 void   PnRightRaw(int row,int xOffset,string text,color clr);
 void   DetermineStatus(string &status,color &clr);
@@ -3085,7 +3086,7 @@ void PnLabel(string id,int x,int y,string text,color clr,int fontSize,string fon
    ObjectSetInteger(0,name,OBJPROP_COLOR,clr);
 }
 
-void PnRect(string id,int x,int y,int w,int h,color border,color bg,int zorder)
+void PnRect(string id,int x,int y,int w,int h,color border,color bg,int zorder,bool back)
 {
    if(w<1) w=1; if(h<1) h=1;
    string name=PN_PREFIX+id;
@@ -3093,13 +3094,17 @@ void PnRect(string id,int x,int y,int w,int h,color border,color bg,int zorder)
    {
       if(!ObjectCreate(0,name,OBJ_RECTANGLE_LABEL,0,0,0)) return;
       ObjectSetInteger(0,name,OBJPROP_CORNER,CORNER_LEFT_UPPER);
-      ObjectSetInteger(0,name,OBJPROP_BACK,false);
       ObjectSetInteger(0,name,OBJPROP_SELECTABLE,false);
       ObjectSetInteger(0,name,OBJPROP_HIDDEN,true);
       ObjectSetInteger(0,name,OBJPROP_BORDER_TYPE,BORDER_FLAT);
       ObjectSetInteger(0,name,OBJPROP_STYLE,STYLE_SOLID);
       ObjectSetInteger(0,name,OBJPROP_WIDTH,1);
    }
+   // OBJPROP_BACK is the ACTUAL layering mechanism for chart objects.
+   // The background pane is drawn in the chart background so no label can
+   // ever be hidden by it; the thin rules sit in the foreground but are
+   // 1 px wide and therefore never overlap text.
+   ObjectSetInteger(0,name,OBJPROP_BACK,back);
    ObjectSetInteger(0,name,OBJPROP_ZORDER,zorder);
    ObjectSetInteger(0,name,OBJPROP_XDISTANCE,x);
    ObjectSetInteger(0,name,OBJPROP_YDISTANCE,y);
@@ -3120,6 +3125,29 @@ string PnSectionText(string title,int width)
    s+=" "+title+" ";
    for(int i=0;i<right;i++) s+="-";
    return s;
+}
+
+//-------------------------------------------------------------------------
+//  CHROME FIRST.
+//
+//  MQL5 paints same-layer chart objects in creation order, so a background
+//  rectangle created AFTER the labels covers them (this was the rendering
+//  bug). Two independent safeguards are applied:
+//    1. the background pane and the rules are CREATED before any label
+//       (this function runs at the very top of RefreshPanel);
+//    2. the background pane is flagged OBJPROP_BACK=true, which puts it in
+//       the chart background layer regardless of creation order.
+//  The objects are persistent - this only creates them once, then each
+//  refresh just repositions/resizes them.
+//-------------------------------------------------------------------------
+void PnEnsureChrome()
+{
+   // Provisional geometry; the final size is applied at the end of
+   // RefreshPanel() once the real row count is known.
+   PnRect("BG",     g_PnX,   g_PnY,   g_PnW, MathMax(40,g_PnH), clrPnBorder, clrPnBG,  0, true);
+   PnRect("HdrLine",g_PnX+4, g_PnY+1, g_PnW-8, 1, clrPnBorder, clrPnBorder, 2, false);
+   PnRect("Sep",    g_PnSepX,g_PnY+1, 1,       1, clrPnSep,    clrPnSep,    2, false);
+   PnRect("FtLine", g_PnX+4, g_PnY+1, g_PnW-8, 1, clrPnBorder, clrPnBorder, 2, false);
 }
 
 //-------------------------------------------------------------------------
@@ -3178,15 +3206,37 @@ int PnTextW(int chars)
 }
 
 // Hide (blank) any pooled row that the current frame no longer uses.
+//-------------------------------------------------------------------------
+//  Blank ONLY the rows that a previous, longer frame used and that the
+//  current frame does not. The loops start at the CURRENT used-count, so
+//  an active row can never be blanked.
+//
+//  Object-name map (all unique, all prefixed with PN_PREFIX):
+//     "L<row>_0"        left column, first field   (label / section title)
+//     "L<row>_<offset>" left column, second field  (offset is a fixed px
+//                       value derived from PnTextW(29), so it can never
+//                       collide with the "_0" slot)
+//     "LA<row>"         left column, first value
+//     "LB<row>"         left column, second value
+//     "R<row>_0"        right column, label / section title / list row
+//     "RV<row>"         right column, value
+//     "RD<index>"       DAILY PROFIT value  (index = day, NOT a row)
+//     "RT<index>"       RECENT TRADES value (index = trade, NOT a row)
+//     "HdrName/HdrSym/HdrStat", "Ft1..Ft5"  header / footer singletons
+//     "BG/HdrLine/Sep/FtLine"               chrome rectangles
+//  The RD/RT namespaces are indexed by list position rather than by row,
+//  so they cannot collide with the R<row> row pool.
+//-------------------------------------------------------------------------
 void PnHideSurplus()
 {
+   int secondFieldOffset=PnTextW(29);
    for(int r=g_PnLeftUsed;r<g_PnLeftPrev && r<PN_MAX_ROWS;r++)
    {
       PnLabel("L"+IntegerToString(r)+"_0",g_PnLeftX,PnRowY(r),"",clrPnDim,g_PnFont);
-      PnLabel("LV"+IntegerToString(r),g_PnLeftX,PnRowY(r),"",clrPnDim,g_PnFont);
+      PnLabel("L"+IntegerToString(r)+"_"+IntegerToString(secondFieldOffset),
+              g_PnLeftX,PnRowY(r),"",clrPnDim,g_PnFont);
       PnLabel("LA"+IntegerToString(r),g_PnLeftX,PnRowY(r),"",clrPnDim,g_PnFont);
       PnLabel("LB"+IntegerToString(r),g_PnLeftX,PnRowY(r),"",clrPnDim,g_PnFont);
-      PnLabel("L"+IntegerToString(r)+"_"+IntegerToString(PnTextW(29)),g_PnLeftX,PnRowY(r),"",clrPnDim,g_PnFont);
    }
    for(int r=g_PnRightUsed;r<g_PnRightPrev && r<PN_MAX_ROWS;r++)
    {
@@ -3506,6 +3556,11 @@ void RefreshPanel()
    int headerH=g_PnRowH+10;
    g_PnBodyTop=g_PnY+headerH+6;
 
+   // >>> CHROME FIRST: the background pane and the rules must exist before
+   //     a single label object is created, otherwise MT5's creation-order
+   //     painting hides the text behind the pane. <<<
+   PnEnsureChrome();
+
    PnMaybeRebuildHistory();
 
    g_PnLeftUsed=0; g_PnRightUsed=0;
@@ -3540,7 +3595,8 @@ void RefreshPanel()
            "XAUUSD_TrendContinuation_V13 | v13.4",clrPnTitle,g_PnFont+2);
    PnLabel("HdrSym",g_PnX+g_PnW/2,g_PnY+5,
            _Symbol+"  "+PnTFName(_Period),clrPnValue,g_PnFont+2);
-   PnLabel("HdrStat",g_PnX+g_PnW-PnTextW(14),g_PnY+5,stTxt+"  *",stClr,g_PnFont+2);
+   // Status lamp stays in the FOREGROUND (labels are never OBJPROP_BACK).
+   PnLabel("HdrStat",g_PnX+g_PnW-PnTextW(15),g_PnY+5,stTxt+"  "+ShortToString(0x25CF),stClr,g_PnFont+2);
 
    //=======================  LEFT COLUMN  ===============================
    int r=0;
@@ -3902,18 +3958,28 @@ void RefreshPanel()
       }
    }
 
-   //=========================  SIZE + CHROME  ===========================
+   //=====================  FINAL SIZING OF THE CHROME  ==================
+   //  The height is derived from the ACTUAL number of rendered rows, so
+   //  the pane tightly frames the content - never a large empty rectangle.
    totalRows=MathMax(g_PnLeftUsed,g_PnRightUsed);
-   int bodyH =totalRows*g_PnRowH;
+   int bodyH  =totalRows*g_PnRowH;
    int footerH=g_PnRowH+8;
-   g_PnH=(g_PnBodyTop-g_PnY)+bodyH+footerH+8;
+   g_PnH=(g_PnBodyTop-g_PnY)+bodyH+6+footerH;
    if(PanelMinHeight>0 && g_PnH<PanelMinHeight) g_PnH=PanelMinHeight;
-
-   PnRect("BG",g_PnX,g_PnY,g_PnW,g_PnH,clrPnBorder,clrPnBG,0);
-   PnRect("HdrLine",g_PnX+4,g_PnY+headerH,g_PnW-8,1,clrPnBorder,clrPnBorder,2);
-   PnRect("Sep",g_PnSepX,g_PnBodyTop-2,1,bodyH+4,clrPnSep,clrPnSep,2);
    g_PnFooterY=g_PnY+g_PnH-footerH;
-   PnRect("FtLine",g_PnX+4,g_PnFooterY,g_PnW-8,1,clrPnBorder,clrPnBorder,2);
+
+   // Re-apply the real geometry to the persistent chrome objects (they
+   // already exist - this only updates position/size, never recreates).
+   PnRect("BG",     g_PnX,    g_PnY,          g_PnW,   g_PnH,
+          clrPnBorder, clrPnBG, 0, true);                       // BACKGROUND layer
+   PnRect("HdrLine",g_PnX+4,  g_PnY+headerH,  g_PnW-8, 1,
+          clrPnBorder, clrPnBorder, 2, false);
+   // divider runs from just under the header rule to just above the footer
+   PnRect("Sep",    g_PnSepX, g_PnY+headerH+2, 1,
+          MathMax(1,g_PnFooterY-(g_PnY+headerH+4)),
+          clrPnSep,    clrPnSep,    2, false);
+   PnRect("FtLine", g_PnX+4,  g_PnFooterY,    g_PnW-8, 1,
+          clrPnBorder, clrPnBorder, 2, false);
 
    //============================  FOOTER  ===============================
    {
