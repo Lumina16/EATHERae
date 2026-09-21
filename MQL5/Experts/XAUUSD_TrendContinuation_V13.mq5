@@ -2970,6 +2970,13 @@ void DrawEntryMarker(ENUM_ORDER_TYPE ot,double price,datetime time,int setupId)
 //=========================================================================
 #define PN_PREFIX "V13_P_"
 #define PN_RPAD    14          // guaranteed right-side padding (px)
+// Stable semantic slot prefixes for the two list sections (row-indexed).
+#define PN_DP_DATE "DP_DATE_"
+#define PN_DP_VAL  "DP_VAL_"
+#define PN_RT_TIME "RT_TIME_"
+#define PN_RT_TYPE "RT_TYPE_"
+#define PN_RT_RES  "RT_RES_"
+#define PN_RT_PL   "RT_PL_"
 
 // ---- forward declarations (MQL5 requires declaration before use) ----
 double PnCharW();
@@ -2979,6 +2986,10 @@ void   PnRect(string id,int x,int y,int w,int h,color border,color bg,int zorder
 void   PnSlotL(string role,int row,int x,string text,color clr);
 void   PnSlotR(string role,int row,int x,string text,color clr);
 void   PnHideExisting(string id);
+int    PnMeasure(string text,int fontSize);
+string PnFitPx(string text,int maxPx,int fontSize);
+void   PnBoundedLabel(string id,int x,int y,string text,color clr,
+                      int maxRight,bool rightAlign,int fontSize);
 string PnFit(string s,int maxChars);
 void   DetermineStatus(string &status,color &clr);
 int    LatestSetupIndex();
@@ -3001,7 +3012,8 @@ int  g_PnLeftCols=0, g_PnRightCols=0;          // section-rule widths (chars)
 int  g_PnRightEdge=0;                          // absolute px, = X+W-PN_RPAD
 // RECENT TRADES: four independent column origins (absolute px) + budgets.
 int  g_PnTrXTime=0, g_PnTrXType=0, g_PnTrXRes=0, g_PnTrXPL=0;
-int  g_PnTrWTime=0, g_PnTrWType=0, g_PnTrWRes=0, g_PnTrWPL=0;
+// DAILY PROFIT: date zone + value zone (absolute px)
+int  g_PnDpXDate=0, g_PnDpXValue=0;
 int  g_PnBodyTop=0, g_PnFooterY=0;
 
 // ---- Dashboard colour scheme (dark navy HUD) ----
@@ -3082,20 +3094,6 @@ string PnFit(string s,int maxChars)
    if(StringLen(s)<=maxChars) return s;
    if(maxChars<=3) return StringSubstr(s,0,maxChars);
    return StringSubstr(s,0,maxChars-3)+"...";
-}
-
-// Right-align a string inside a fixed character width (numeric columns).
-string PnPadLeft(string s,int width)
-{
-   int n=StringLen(s);
-   if(n>=width)
-   {
-      if(width<4) return StringSubstr(s,0,width);
-      return StringSubstr(s,0,width-1)+".";
-   }
-   string out="";
-   for(int i=n;i<width;i++) out+=" ";
-   return out+s;
 }
 
 string PnPad(string s,int width)
@@ -3267,6 +3265,8 @@ void PnRightBlankRow(int row)
    PnHideExisting("RT_RES_"+sr);
    PnHideExisting("RT_PL_"+sr);
    PnHideExisting("RD_"+sr);
+   PnHideExisting("DP_DATE_"+sr);
+   PnHideExisting("DP_VAL_"+sr);
 }
 
 // Blank every right-row slot EXCEPT the named role (used when a row holds
@@ -3282,6 +3282,8 @@ void PnRightBlankRowExcept(int row,string keep)
    if(keep!="RT_RES")  PnHideExisting("RT_RES_"+sr);
    if(keep!="RT_PL")   PnHideExisting("RT_PL_"+sr);
    if(keep!="RD")      PnHideExisting("RD_"+sr);
+   if(keep!="DP_DATE") PnHideExisting("DP_DATE_"+sr);
+   if(keep!="DP_VAL")  PnHideExisting("DP_VAL_"+sr);
 }
 
 // Blank an ALREADY EXISTING slot. Never creates an object, so this can
@@ -3308,6 +3310,7 @@ void PnRightSection(int row,string title)
    PnHideExisting("RT_TIME_"+sr); PnHideExisting("RT_TYPE_"+sr);
    PnHideExisting("RT_RES_"+sr);  PnHideExisting("RT_PL_"+sr);
    PnHideExisting("RD_"+sr);
+   PnHideExisting("DP_DATE_"+sr); PnHideExisting("DP_VAL_"+sr);
 }
 
 //-------------------------------------------------------------------------
@@ -3353,12 +3356,77 @@ void PnRightKV(int row,string label,string value,color vClr)
    PnHideExisting("RT_TYPE_"+IntegerToString(row));
    PnHideExisting("RT_RES_" +IntegerToString(row));
    PnHideExisting("RT_PL_"  +IntegerToString(row));
+   PnHideExisting("DP_DATE_"+IntegerToString(row));
+   PnHideExisting("DP_VAL_" +IntegerToString(row));
 }
 
 // Monospace advance width (px per character) for the configured font size.
 double PnCharW()
 {
-   return g_PnFont*0.62+0.85;        // Consolas ~0.6em advance
+   return g_PnFont*0.62+0.85;        // Consolas ~0.6em advance (rough)
+}
+
+//-------------------------------------------------------------------------
+//  REAL pixel measurement.
+//
+//  Every previous overflow came from ESTIMATING the advance width. MT5 can
+//  measure the actual rendered string, so all right-side placement now uses
+//  this instead of a guess.
+//-------------------------------------------------------------------------
+int PnMeasure(string text,int fontSize)
+{
+   if(text=="") return 0;
+   uint w=0,h=0;
+   TextSetFont("Consolas",-fontSize*10,FW_NORMAL,0);
+   if(!TextGetSize(text,w,h))
+      return (int)MathRound(StringLen(text)*(fontSize*0.62+0.85));   // fallback
+   return (int)w;
+}
+
+//-------------------------------------------------------------------------
+//  Truncate a string until it really fits inside maxPx.
+//-------------------------------------------------------------------------
+string PnFitPx(string text,int maxPx,int fontSize)
+{
+   if(maxPx<=0) return "";
+   if(PnMeasure(text,fontSize)<=maxPx) return text;
+   string t=text;
+   while(StringLen(t)>1)
+   {
+      t=StringSubstr(t,0,StringLen(t)-1);
+      if(PnMeasure(t+"...",fontSize)<=maxPx) return t+"...";
+   }
+   return "";
+}
+
+//-------------------------------------------------------------------------
+//  HARD BOUNDARY LABEL. Places text at x, but guarantees the rendered text
+//  ends at or before maxRight. rightAlign=true pins the END of the text to
+//  maxRight (used for numeric columns); otherwise the text is truncated.
+//  No right-column object may bypass this helper.
+//-------------------------------------------------------------------------
+void PnBoundedLabel(string id,int x,int y,string text,color clr,
+                    int maxRight,bool rightAlign,int fontSize)
+{
+   string t=text;
+   int w=PnMeasure(t,fontSize);
+
+   if(rightAlign)
+   {
+      // pin the end of the text to maxRight, but never start left of x
+      int avail=maxRight-x;
+      if(w>avail) { t=PnFitPx(t,avail,fontSize); w=PnMeasure(t,fontSize); }
+      int px=maxRight-w;
+      if(px<x) px=x;
+      PnLabel(id,px,y,t,clr,fontSize);
+      return;
+   }
+
+   if(x+w>maxRight)
+   {
+      t=PnFitPx(t,maxRight-x,fontSize);
+   }
+   PnLabel(id,x,y,t,clr,fontSize);
 }
 
 // Approximate pixel width of N monospace characters.
@@ -3738,16 +3806,19 @@ void RefreshPanel()
    // value budget measured to the hard edge
    g_PnRZ2W=(int)MathMax(6,MathFloor((double)(rUsable-g_PnRZ2)/cw));
 
-   //---- RECENT TRADES: four independent, non-overlapping columns -------
-   int colGap=10;
-   g_PnTrWTime=11;                                   // "03/09 15:42"
-   g_PnTrWType=4;                                    // "Sell"
-   g_PnTrWRes =4;                                    // "LOSS"
-   g_PnTrXTime=g_PnRightX;
-   g_PnTrXType=g_PnTrXTime+PnTextW(g_PnTrWTime)+colGap;
-   g_PnTrXRes =g_PnTrXType+PnTextW(g_PnTrWType)+colGap;
-   g_PnTrXPL  =g_PnTrXRes +PnTextW(g_PnTrWRes )+colGap;
-   g_PnTrWPL  =(int)MathMax(5,MathFloor((double)(g_PnRightEdge-g_PnTrXPL)/cw));
+   //---- RECENT TRADES: four ABSOLUTE pixel regions inside the right
+   //     column, allocated as fractions of the real drawable width. The
+   //     P/L region ENDS exactly at g_PnRightEdge - never beyond.
+   int rtLeft =g_PnRightX;
+   int rtWidth=g_PnRightEdge-rtLeft;
+   g_PnTrXTime=rtLeft;
+   g_PnTrXType=rtLeft+(int)MathRound(rtWidth*0.40);
+   g_PnTrXRes =rtLeft+(int)MathRound(rtWidth*0.57);
+   g_PnTrXPL  =rtLeft+(int)MathRound(rtWidth*0.76);
+
+   //---- DAILY PROFIT: two zones (date | value), value bounded by the edge
+   g_PnDpXDate =g_PnRightX;
+   g_PnDpXValue=g_PnRightX+(int)MathRound(rtWidth*0.30);
 
    int headerH=g_PnRowH+12;
    g_PnBodyTop=g_PnY+headerH+6;
@@ -3803,29 +3874,39 @@ void RefreshPanel()
 
    string hdrName="XAUUSD_TrendContinuation_V13 | v13.4";
    string hdrSym =_Symbol+"   "+PnTFName(_Period);
-   string hdrStat=stTxt+"  "+ShortToString(0x25CF);
 
-   int statW=(int)MathRound(StringLen(hdrStat)*hdrCharW);
-   int statX=g_PnX+g_PnW-PN_RPAD-statW;
-   // never let the status run back into the centred symbol block
-   int nameEnd=g_PnLeftX+(int)MathRound(StringLen(hdrName)*hdrCharW);
-   if(statX<nameEnd+20)
+   //  STATUS = TEXT + a separate small LAMP (no oversized Unicode bullet,
+   //  which scales unpredictably with the font). The lamp is a tiny
+   //  rectangle laid out from the right edge inward:
+   //      lampRight = panelRight - PN_RPAD
+   int lampSize =6;
+   int lampGap  =7;
+   int lampRight=g_PnX+g_PnW-PN_RPAD;
+   int lampX    =lampRight-lampSize;
+
+   int nameEnd=g_PnLeftX+PnMeasure(hdrName,hdrFont);
+   int statW  =PnMeasure(stTxt,hdrFont);
+   int statX  =lampX-lampGap-statW;
+   if(statX<nameEnd+20)                       // very long status: truncate
    {
-      int avail=(int)MathFloor((double)(g_PnX+g_PnW-PN_RPAD-(nameEnd+20))/hdrCharW);
-      hdrStat=PnFit(hdrStat,MathMax(4,avail));
-      statW=(int)MathRound(StringLen(hdrStat)*hdrCharW);
-      statX=g_PnX+g_PnW-PN_RPAD-statW;
+      stTxt =PnFitPx(stTxt,lampX-lampGap-(nameEnd+20),hdrFont);
+      statW =PnMeasure(stTxt,hdrFont);
+      statX =lampX-lampGap-statW;
    }
 
-   int symX=g_PnX+(g_PnW-(int)MathRound(StringLen(hdrSym)*hdrCharW))/2;
-   if(symX<nameEnd+16) symX=nameEnd+16;
-   if(symX+(int)MathRound(StringLen(hdrSym)*hdrCharW)>statX-16)
-      symX=statX-16-(int)MathRound(StringLen(hdrSym)*hdrCharW);
+   int symW=PnMeasure(hdrSym,hdrFont);
+   int symX=g_PnX+(g_PnW-symW)/2;
+   if(symX<nameEnd+16)          symX=nameEnd+16;
+   if(symX+symW>statX-16)       symX=statX-16-symW;
 
    PnLabel("HdrName",g_PnLeftX,hdrY,hdrName,clrPnTitle,hdrFont);
    PnLabel("HdrSym", symX,    hdrY,hdrSym, clrPnValue,hdrFont);
-   // Status lamp is a foreground label -> always above the opaque pane.
-   PnLabel("HdrStat",statX,   hdrY,hdrStat,stClr,hdrFont);
+   PnLabel("HdrStat",statX,   hdrY,stTxt,  stClr,     hdrFont);
+
+   // Small status lamp, vertically centred against the status text.
+   int lampY=hdrY+(int)MathRound(hdrFont*1.35*0.5)-lampSize/2;
+   if(lampY<g_PnY+4) lampY=g_PnY+4;
+   PnRect("HdrLamp",lampX,lampY,lampSize,lampSize,stClr,stClr,3,false);
 
    //=======================  LEFT COLUMN  ===============================
    int r=0;
@@ -4118,52 +4199,63 @@ void RefreshPanel()
    PnRightBlankRow(rr++);
 
    // ---- B. DAILY PROFIT HISTORY ----
+   //  TWO pixel zones: date (left aligned) and value (RIGHT aligned to the
+   //  hard content edge). The value is measured with TextGetSize, so it can
+   //  never cross the border; if "USD (pct%)" will not fit, the percentage
+   //  is dropped before the number is ever truncated.
    PnRightSection(rr++,"DAILY PROFIT");
    {
-      // Always render all PN_DAYS slots. A day with no EA trades shows a
-      // real zero; a day with no data at all shows "--" (never fabricated).
       for(int d=0;d<PN_DAYS;d++)
       {
+         string sr=IntegerToString(rr);
          string lbl=(g_PnDayLabel[d]!="")?g_PnDayLabel[d]:"--";
-         PnSlotR("RL",rr,g_PnRZ1,PnFit(lbl,g_PnRZ1W),clrPnLabel);
-         PnHideExisting("RS_"+IntegerToString(rr));
-         PnHideExisting("RV_"+IntegerToString(rr));
+         PnBoundedLabel(PN_DP_DATE+sr,g_PnDpXDate,PnRowY(rr),lbl,clrPnLabel,
+                        g_PnDpXValue-6,false,g_PnFont);
+
          string vTxt; color vClr;
-         if(!g_PnDayUsed[d])
-         {
-            vTxt=PnPadLeft("--",g_PnRZ2W); vClr=clrPnDim;
-         }
+         if(!g_PnDayUsed[d]) { vTxt="--"; vClr=clrPnDim; }
          else
          {
             double v=g_PnDayPL[d];
             double refBal=bal-v;
-            string pctTxt=(refBal>0.0)?StringFormat(" (%.2f%%)",100.0*v/refBal):"";
-            vTxt=PnPadLeft(StringFormat("%+.2f USD%s",v,pctTxt),g_PnRZ2W);
-            vClr=PnPLColor(v);
+            string full=StringFormat("%+.2f USD",v);
+            if(refBal>0.0)
+            {
+               string withPct=full+StringFormat("  (%.2f%%)",100.0*v/refBal);
+               // keep the percentage ONLY if it genuinely fits
+               if(PnMeasure(withPct,g_PnFont)<=g_PnRightEdge-g_PnDpXValue)
+                  full=withPct;
+            }
+            vTxt=full; vClr=PnPLColor(v);
          }
-         int dMax=(int)MathFloor((double)(g_PnRightEdge-(g_PnRightX+g_PnRZ2))/PnCharW());
-         PnSlotR("RD",rr,g_PnRZ2,PnFit(vTxt,dMax),vClr);
-         PnHideExisting("RV_"+IntegerToString(rr));
+         PnBoundedLabel(PN_DP_VAL+sr,g_PnDpXValue,PnRowY(rr),vTxt,vClr,
+                        g_PnRightEdge,true,g_PnFont);
+
+         if(rr+1>g_PnRightUsed) g_PnRightUsed=rr+1;
+         PnHideExisting("RS_"+sr); PnHideExisting("RL_"+sr);
+         PnHideExisting("RV_"+sr);
+         PnHideExisting("RT_TIME_"+sr); PnHideExisting("RT_TYPE_"+sr);
+         PnHideExisting("RT_RES_"+sr);  PnHideExisting("RT_PL_"+sr);
          rr++;
       }
    }
    PnRightBlankRow(rr++);
 
    // ---- C. RECENT TRADES ----
-   //  FOUR independent, individually positioned labels per row. Nothing is
-   //  concatenated into a padded string any more, so "SellWIN" /
-   //  "TypeResult" collisions are structurally impossible. The P/L column
-   //  is right-aligned against the hard right edge.
+   //  FOUR independent labels per row at ABSOLUTE pixel origins allocated
+   //  as fractions of the real drawable width. Nothing is concatenated and
+   //  nothing is space-padded, so "SellWIN" / "10:30Sell" are structurally
+   //  impossible. P/L is right-aligned to the hard content edge.
    PnRightSection(rr++,"RECENT TRADES");
    {
-      // header - one label per column, same origins as the data rows
-      PnSlotR("RL",rr,g_PnTrXTime-g_PnRightX,"Time",clrPnDim);
-      PnSlotR("RT_TYPE",rr,g_PnTrXType-g_PnRightX,"Type",clrPnDim);
-      PnSlotR("RT_RES", rr,g_PnTrXRes -g_PnRightX,"Res",clrPnDim);
-      PnSlotR("RT_PL",  rr,g_PnTrXPL  -g_PnRightX,PnPadLeft("P/L",g_PnTrWPL),clrPnDim);
-      PnHideExisting("RS_"+IntegerToString(rr));
-      PnHideExisting("RV_"+IntegerToString(rr));
-      PnHideExisting("RD_"+IntegerToString(rr));
+      string hr=IntegerToString(rr);
+      PnBoundedLabel(PN_RT_TIME+hr,g_PnTrXTime,PnRowY(rr),"Time",  clrPnDim,g_PnTrXType-6,false,g_PnFont);
+      PnBoundedLabel(PN_RT_TYPE+hr,g_PnTrXType,PnRowY(rr),"Type",  clrPnDim,g_PnTrXRes -6,false,g_PnFont);
+      PnBoundedLabel(PN_RT_RES +hr,g_PnTrXRes, PnRowY(rr),"Result",clrPnDim,g_PnTrXPL  -6,false,g_PnFont);
+      PnBoundedLabel(PN_RT_PL  +hr,g_PnTrXPL,  PnRowY(rr),"P/L",   clrPnDim,g_PnRightEdge,true,g_PnFont);
+      if(rr+1>g_PnRightUsed) g_PnRightUsed=rr+1;
+      PnHideExisting("RS_"+hr); PnHideExisting("RL_"+hr);
+      PnHideExisting("RV_"+hr); PnHideExisting("RD_"+hr);
       rr++;
 
       if(g_PnTrCount<=0)
@@ -4176,19 +4268,23 @@ void RefreshPanel()
       {
          for(int t=0;t<g_PnTrCount;t++)
          {
+            string dr=IntegerToString(rr);
             bool win=(g_PnTrPL[t]>=0);
-            PnSlotR("RL",     rr,g_PnTrXTime-g_PnRightX,
-                    PnFit(g_PnTrTime[t],g_PnTrWTime),clrPnValue);
-            PnSlotR("RT_TYPE",rr,g_PnTrXType-g_PnRightX,
-                    PnFit(g_PnTrType[t],g_PnTrWType),clrPnValue);
-            PnSlotR("RT_RES", rr,g_PnTrXRes -g_PnRightX,
-                    (win?"WIN":"LOSS"),(win?clrPnGood:clrPnBad));
-            PnSlotR("RT_PL",  rr,g_PnTrXPL  -g_PnRightX,
-                    PnPadLeft(PnFit(StringFormat("%+.2f",g_PnTrPL[t]),g_PnTrWPL),g_PnTrWPL),
-                    (win?clrPnGood:clrPnBad));
-            PnHideExisting("RS_"+IntegerToString(rr));
-            PnHideExisting("RV_"+IntegerToString(rr));
-            PnHideExisting("RD_"+IntegerToString(rr));
+            color wClr=(win?clrPnGood:clrPnBad);
+
+            PnBoundedLabel(PN_RT_TIME+dr,g_PnTrXTime,PnRowY(rr),
+                           g_PnTrTime[t],clrPnValue,g_PnTrXType-6,false,g_PnFont);
+            PnBoundedLabel(PN_RT_TYPE+dr,g_PnTrXType,PnRowY(rr),
+                           g_PnTrType[t],clrPnValue,g_PnTrXRes-6,false,g_PnFont);
+            PnBoundedLabel(PN_RT_RES +dr,g_PnTrXRes, PnRowY(rr),
+                           (win?"WIN":"LOSS"),wClr,g_PnTrXPL-6,false,g_PnFont);
+            PnBoundedLabel(PN_RT_PL  +dr,g_PnTrXPL,  PnRowY(rr),
+                           StringFormat("%+.2f",g_PnTrPL[t]),wClr,
+                           g_PnRightEdge,true,g_PnFont);
+
+            if(rr+1>g_PnRightUsed) g_PnRightUsed=rr+1;
+            PnHideExisting("RS_"+dr); PnHideExisting("RL_"+dr);
+            PnHideExisting("RV_"+dr); PnHideExisting("RD_"+dr);
             rr++;
          }
       }
