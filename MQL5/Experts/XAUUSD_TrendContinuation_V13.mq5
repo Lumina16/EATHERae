@@ -119,6 +119,15 @@ input int    M1WarmupBars      = 300;
 input long   MagicNumber       = 20260915;
 input int    MaxSlippagePoints = 30;
 
+input group "PANEL (DISPLAY ONLY)"
+input int    PanelX                 = 10;    // panel left offset (px)
+input int    PanelY                 = 18;    // panel top offset (px)
+input int    PanelWidth             = 900;   // total panel width (px)
+input int    PanelMinHeight         = 0;     // 0 = auto height
+input int    PanelRowHeight         = 14;    // row pitch (px)
+input int    PanelFontSize          = 8;     // body font size
+input int    PanelHistoryRefreshSec = 5;     // history re-scan interval (s)
+
 input group "DEBUG"
 input bool   DebugMode  = false;
 input bool   DebugHTF   = false;
@@ -318,6 +327,11 @@ int g_Cnt_EntryAttempts=0, g_Cnt_EntryExecuted=0, g_Cnt_EntryBlocked=0, g_Cnt_En
 int g_Cnt_RejectLot=0, g_Cnt_RejectStops=0, g_Cnt_RejectMargin=0;
 int g_Cnt_RejectFilling=0, g_Cnt_RejectBroker=0, g_Cnt_RejectOther=0;
 
+// ---- Dashboard panel shared state (UI only - no trading influence) ----
+bool   g_PnHistoryDirty=true;   // set by OnTradeTransaction: force history re-scan
+double g_PnDayPeakEquity=0;     // intraday equity peak (display drawdown)
+double g_PnDayDDPct=0;          // intraday equity drawdown %
+
 // ---- LAST ACTION ----
 string g_LastAction = "Initialized - replaying history";
 
@@ -341,6 +355,7 @@ bool   CheckEntryPermissions(ENUM_BIAS dir,string &reason);
 bool   ExecuteSetupTrade(M1Setup &s,double refPrice);
 void   RefreshPanel();
 void   ClearPanelObjects();
+void   DetermineStatus(string &status,color &clr);
 void   PrintBacktestSummary();
 void   FeedPivotBullish(int idx,ENUM_SWING_TYPE type,double price,datetime time,double atrM1);
 void   FeedPivotBearish(int idx,ENUM_SWING_TYPE type,double price,datetime time,double atrM1);
@@ -560,6 +575,9 @@ void CheckNewDay()
    g_DayBal=AccountInfoDouble(ACCOUNT_BALANCE);
    g_DayPL=0; g_ConsLoss=0;
    g_HaltedDaily=false; g_HaltedConsec=false; g_HaltedFloat=false;
+   g_PnDayPeakEquity=AccountInfoDouble(ACCOUNT_EQUITY);   // panel: new day, new peak
+   g_PnDayDDPct=0;
+   g_PnHistoryDirty=true;                                  // panel: refresh day buckets
 }
 
 bool EntriesHalted()
@@ -575,6 +593,14 @@ void UpdateDrawdownTracking()
    {
       double dd=(g_PeakEquity-eq)/g_PeakEquity*100.0;
       if(dd>g_MaxDrawdownPct) g_MaxDrawdownPct=dd;
+   }
+
+   // ---- panel-only intraday drawdown (never affects trading) ----
+   if(eq>g_PnDayPeakEquity || g_PnDayPeakEquity<=0) g_PnDayPeakEquity=eq;
+   if(g_PnDayPeakEquity>0)
+   {
+      double ddd=(g_PnDayPeakEquity-eq)/g_PnDayPeakEquity*100.0;
+      if(ddd>g_PnDayDDPct) g_PnDayDDPct=ddd;
    }
 }
 
@@ -2234,6 +2260,8 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    if(profit>0)      { g_Wins++;   g_SumWinProfit+=profit;  if(profit>g_LargestWin)  g_LargestWin=profit; }
    else if(profit<0) { g_Losses++; g_SumLossProfit+=profit; if(profit<g_LargestLoss) g_LargestLoss=profit; }
 
+   g_PnHistoryDirty=true;   // panel: recent-trades / daily series need a re-scan
+
    g_LastAction=StringFormat("Trade closed  P/L $%.2f  (Total $%.2f)",profit,g_TotalRealizedPL);
    PrintFormat("[TRADE] Closed positionId=%I64d profit=%.2f | Total=%.2f Wins=%d Losses=%d Streak=%d",
                posId,profit,g_TotalRealizedPL,g_Wins,g_Losses,g_ConsLoss);
@@ -2734,63 +2762,168 @@ void DrawEntryMarker(ENUM_ORDER_TYPE ot,double price,datetime time,int setupId)
 }
 
 //=========================================================================
-//              COMPACT RECTANGLE DIAGNOSTIC PANEL (V13 layout)
-//  Same single expanded panel as V13.3: original left column + the M30
-//  S/R column on the right, separated by one thin vertical line. No new
-//  headings. When the S/R module is OFF the right column simply reports
-//  OFF and never shows blocking text.
+//        V13.4 PROFESSIONAL DASHBOARD PANEL  (UI ONLY - NO TRADING LOGIC)
+//
+//  Single expanded two-column HUD panel:
+//     HEADER  : EA name/version, symbol, timeframe, live status lamp
+//     LEFT    : Account & Risk / Trade Safety / Multi-Timeframe Bias +
+//               M30 S/R Filter / Open Trades + Setup Status / Today
+//     RIGHT   : Max Floating Loss / Daily Profit history / Recent Trades
+//     FOOTER  : local time, next action + M1 check progress, server time,
+//               broker/server name, connection state
+//
+//  Rendering rules (performance + stability):
+//   - every label is a persistent OBJ_LABEL with a stable name; objects
+//     are created once and only their TEXT/COLOR are updated afterwards,
+//     so there is no flicker and no per-tick object churn;
+//   - the row pool is reused and any surplus row from a previous, longer
+//     frame is hidden (empty text) rather than deleted/recreated;
+//   - the expensive history scans (daily P/L series, recent trade list)
+//     are cached and refreshed at most once per PanelHistoryRefreshSec,
+//     or immediately when a deal closes (g_PnHistoryDirty);
+//   - the panel reads state only. It never calls a function that can
+//     change EA state, never opens/closes/filters trades, and is only
+//     invoked from OnTick() behind the existing DebugMode switch.
 //=========================================================================
-#define PANEL_X       10
-#define PANEL_Y       20
-#define PANEL_LEFT_W  330
-#define PANEL_GAP     18
-#define PANEL_RIGHT_W 210
-#define PANEL_WIDTH   (PANEL_LEFT_W+PANEL_GAP+PANEL_RIGHT_W)
-#define PANEL_ROWH    14
+#define PN_PREFIX "V13_P_"
 
-color clrPanelBG     = C'18,18,18';
-color clrPanelBorder = C'80,80,80';
-color clrTitle       = clrGold;
-color clrNormal      = clrSilver;
-color clrGood        = clrLimeGreen;
-color clrBad         = clrOrangeRed;
-color clrWarn        = clrOrange;
-color clrBuyC        = clrLimeGreen;
-color clrSellC       = clrTomato;
-color clrDim         = clrGray;
+// ---- forward declarations (MQL5 requires declaration before use) ----
+int    PnTextW(int chars);
+void   PnLabel(string id,int x,int y,string text,color clr,int fontSize,string font="Consolas");
+void   PnRect(string id,int x,int y,int w,int h,color border,color bg,int zorder);
+void   PnLeftRaw(int row,int xOffset,string text,color clr);
+void   PnRightRaw(int row,int xOffset,string text,color clr);
+void   DetermineStatus(string &status,color &clr);
+int    LatestSetupIndex();
+void   PnRebuildHistory();
 
-string g_PanelLines[64];
-color  g_PanelColors[64];
-int    g_PanelLineCount=0;
-int    g_PanelRowPrevCount=0;
 
-string g_PanelRightLines[16];
-color  g_PanelRightColors[16];
-int    g_PanelRightLineCount=0;
-int    g_PanelRightRowPrevCount=0;
+// ---- Layout (all derived from the configurable inputs) ----
+int  g_PnX=0, g_PnY=0, g_PnW=0, g_PnH=0;
+int  g_PnRowH=0, g_PnFont=0;
+int  g_PnLeftX=0, g_PnRightX=0, g_PnSepX=0, g_PnColW=0;
+int  g_PnBodyTop=0, g_PnFooterY=0;
 
-void PanelAdd(string text,color clr)
+// ---- Dashboard colour scheme (dark navy HUD) ----
+color clrPnBG      = C'8,12,24';        // dark navy background
+color clrPnBorder  = C'0,160,200';      // cyan border
+color clrPnSection = C'0,200,235';      // cyan section headers
+color clrPnSep     = C'0,80,110';       // thin cyan separators
+color clrPnLabel   = C'190,200,215';    // light grey labels
+color clrPnValue   = C'225,235,245';    // near-white values
+color clrPnGood    = C'0,230,118';      // green
+color clrPnBad     = C'255,82,82';      // red
+color clrPnWarn    = C'255,193,7';      // amber
+color clrPnDim     = C'110,125,145';    // dimmed / N/A
+color clrPnTitle   = C'64,196,255';     // header text
+
+// Legacy aliases kept so any other code referring to them still compiles.
+color clrPanelBG     = C'8,12,24';
+color clrPanelBorder = C'0,160,200';
+color clrTitle       = C'64,196,255';
+color clrNormal      = C'225,235,245';
+color clrGood        = C'0,230,118';
+color clrBad         = C'255,82,82';
+color clrWarn        = C'255,193,7';
+color clrBuyC        = C'0,230,118';
+color clrSellC       = C'255,82,82';
+color clrDim         = C'110,125,145';
+
+#define PN_MAX_ROWS 80
+int    g_PnLeftUsed=0,  g_PnLeftPrev=0;
+int    g_PnRightUsed=0, g_PnRightPrev=0;
+
+// ---- Cached history (daily series + recent trades) ----
+#define PN_DAYS   7
+#define PN_TRADES 8
+
+string   g_PnDayLabel[PN_DAYS];
+double   g_PnDayPL[PN_DAYS];
+bool     g_PnDayUsed[PN_DAYS];
+int      g_PnDayCount=0;
+
+string   g_PnTrTime[PN_TRADES];
+string   g_PnTrType[PN_TRADES];
+double   g_PnTrPL[PN_TRADES];
+int      g_PnTrCount=0;
+
+double   g_PnTodayWinSum=0, g_PnTodayLossSum=0;
+int      g_PnTodayTrades=0, g_PnTodayWins=0, g_PnTodayLosses=0;
+int      g_PnConsWins=0;
+datetime g_PnHistoryLast=0;
+
+//-------------------------------------------------------------------------
+//  Small formatting helpers (display only)
+//-------------------------------------------------------------------------
+string PnMoney(double v,bool sign)
 {
-   if(g_PanelLineCount>=64) return;
-   g_PanelLines[g_PanelLineCount]=text;
-   g_PanelColors[g_PanelLineCount]=clr;
-   g_PanelLineCount++;
+   if(sign) return StringFormat("%+.2f USD",v);
+   return StringFormat("%.2f USD",v);
 }
 
-void PanelRightAdd(string text,color clr)
+string PnPct(double num,double den)
 {
-   if(g_PanelRightLineCount>=16) return;
-   g_PanelRightLines[g_PanelRightLineCount]=text;
-   g_PanelRightColors[g_PanelRightLineCount]=clr;
-   g_PanelRightLineCount++;
+   if(den==0.0) return "--";
+   return StringFormat("(%.2f%%)",100.0*num/den);
 }
 
-void EnsurePanelBackground(int height)
+color PnPLColor(double v)
 {
-   string name="V13_PanelBG";
+   if(v>0) return clrPnGood;
+   if(v<0) return clrPnBad;
+   return clrPnValue;
+}
+
+string PnPad(string s,int width)
+{
+   int n=StringLen(s);
+   if(n>=width)
+   {
+      if(width<4) return StringSubstr(s,0,width);
+      return StringSubstr(s,0,width-1)+".";
+   }
+   string out=s;
+   for(int i=n;i<width;i++) out+=" ";
+   return out;
+}
+
+string PnTFName(ENUM_TIMEFRAMES tf)
+{
+   string s=EnumToString(tf);
+   int p=StringFind(s,"PERIOD_");
+   if(p==0) s=StringSubstr(s,7);
+   return s;
+}
+
+//-------------------------------------------------------------------------
+//  Object primitives - create once, then update text/colour only.
+//-------------------------------------------------------------------------
+void PnLabel(string id,int x,int y,string text,color clr,int fontSize,string font)
+{
+   string name=PN_PREFIX+id;
    if(ObjectFind(0,name)<0)
    {
-      ObjectCreate(0,name,OBJ_RECTANGLE_LABEL,0,0,0);
+      if(!ObjectCreate(0,name,OBJ_LABEL,0,0,0)) return;
+      ObjectSetInteger(0,name,OBJPROP_CORNER,CORNER_LEFT_UPPER);
+      ObjectSetInteger(0,name,OBJPROP_SELECTABLE,false);
+      ObjectSetInteger(0,name,OBJPROP_HIDDEN,true);
+      ObjectSetInteger(0,name,OBJPROP_ZORDER,10);
+      ObjectSetString (0,name,OBJPROP_FONT,font);
+      ObjectSetInteger(0,name,OBJPROP_FONTSIZE,fontSize);
+   }
+   ObjectSetInteger(0,name,OBJPROP_XDISTANCE,x);
+   ObjectSetInteger(0,name,OBJPROP_YDISTANCE,y);
+   ObjectSetString (0,name,OBJPROP_TEXT,text);
+   ObjectSetInteger(0,name,OBJPROP_COLOR,clr);
+}
+
+void PnRect(string id,int x,int y,int w,int h,color border,color bg,int zorder)
+{
+   if(w<1) w=1; if(h<1) h=1;
+   string name=PN_PREFIX+id;
+   if(ObjectFind(0,name)<0)
+   {
+      if(!ObjectCreate(0,name,OBJ_RECTANGLE_LABEL,0,0,0)) return;
       ObjectSetInteger(0,name,OBJPROP_CORNER,CORNER_LEFT_UPPER);
       ObjectSetInteger(0,name,OBJPROP_BACK,false);
       ObjectSetInteger(0,name,OBJPROP_SELECTABLE,false);
@@ -2798,133 +2931,305 @@ void EnsurePanelBackground(int height)
       ObjectSetInteger(0,name,OBJPROP_BORDER_TYPE,BORDER_FLAT);
       ObjectSetInteger(0,name,OBJPROP_STYLE,STYLE_SOLID);
       ObjectSetInteger(0,name,OBJPROP_WIDTH,1);
-      ObjectSetInteger(0,name,OBJPROP_COLOR,clrPanelBorder);
-      ObjectSetInteger(0,name,OBJPROP_BGCOLOR,clrPanelBG);
    }
-   ObjectSetInteger(0,name,OBJPROP_ZORDER,0);
-   ObjectSetInteger(0,name,OBJPROP_XDISTANCE,PANEL_X-6);
-   ObjectSetInteger(0,name,OBJPROP_YDISTANCE,PANEL_Y-6);
-   ObjectSetInteger(0,name,OBJPROP_XSIZE,PANEL_WIDTH);
-   ObjectSetInteger(0,name,OBJPROP_YSIZE,height);
-}
-
-void EnsureSeparator(int height)
-{
-   string name="V13_PanelSep";
-   if(ObjectFind(0,name)<0)
-   {
-      ObjectCreate(0,name,OBJ_RECTANGLE_LABEL,0,0,0);
-      ObjectSetInteger(0,name,OBJPROP_CORNER,CORNER_LEFT_UPPER);
-      ObjectSetInteger(0,name,OBJPROP_BACK,false);
-      ObjectSetInteger(0,name,OBJPROP_SELECTABLE,false);
-      ObjectSetInteger(0,name,OBJPROP_HIDDEN,true);
-      ObjectSetInteger(0,name,OBJPROP_BORDER_TYPE,BORDER_FLAT);
-      ObjectSetInteger(0,name,OBJPROP_COLOR,clrPanelBorder);
-      ObjectSetInteger(0,name,OBJPROP_BGCOLOR,clrPanelBorder);
-   }
-   ObjectSetInteger(0,name,OBJPROP_ZORDER,4);
-   ObjectSetInteger(0,name,OBJPROP_XDISTANCE,PANEL_X+PANEL_LEFT_W+PANEL_GAP/2);
-   ObjectSetInteger(0,name,OBJPROP_YDISTANCE,PANEL_Y-2);
-   ObjectSetInteger(0,name,OBJPROP_XSIZE,1);
-   ObjectSetInteger(0,name,OBJPROP_YSIZE,height-4);
-}
-
-void EnsureTitle()
-{
-   string name="V13_PanelTitle";
-   if(ObjectFind(0,name)<0)
-   {
-      ObjectCreate(0,name,OBJ_LABEL,0,0,0);
-      ObjectSetInteger(0,name,OBJPROP_CORNER,CORNER_LEFT_UPPER);
-      ObjectSetString(0,name,OBJPROP_FONT,"Consolas");
-      ObjectSetInteger(0,name,OBJPROP_FONTSIZE,10);
-      ObjectSetInteger(0,name,OBJPROP_SELECTABLE,false);
-      ObjectSetInteger(0,name,OBJPROP_HIDDEN,true);
-   }
-   ObjectSetInteger(0,name,OBJPROP_ZORDER,5);
-   ObjectSetInteger(0,name,OBJPROP_XDISTANCE,PANEL_X);
-   ObjectSetInteger(0,name,OBJPROP_YDISTANCE,PANEL_Y);
-   ObjectSetString(0,name,OBJPROP_TEXT,"XAUUSD SCALPER  |  V13 MULTI-SETUP");
-   ObjectSetInteger(0,name,OBJPROP_COLOR,clrTitle);
-}
-
-void PanelRow(int index,int y,string text,color clr)
-{
-   string name="V13_PanelRow"+IntegerToString(index);
-   if(ObjectFind(0,name)<0)
-   {
-      ObjectCreate(0,name,OBJ_LABEL,0,0,0);
-      ObjectSetInteger(0,name,OBJPROP_CORNER,CORNER_LEFT_UPPER);
-      ObjectSetString(0,name,OBJPROP_FONT,"Consolas");
-      ObjectSetInteger(0,name,OBJPROP_FONTSIZE,8);
-      ObjectSetInteger(0,name,OBJPROP_SELECTABLE,false);
-      ObjectSetInteger(0,name,OBJPROP_HIDDEN,true);
-   }
-   ObjectSetInteger(0,name,OBJPROP_ZORDER,5);
-   ObjectSetInteger(0,name,OBJPROP_XDISTANCE,PANEL_X);
+   ObjectSetInteger(0,name,OBJPROP_ZORDER,zorder);
+   ObjectSetInteger(0,name,OBJPROP_XDISTANCE,x);
    ObjectSetInteger(0,name,OBJPROP_YDISTANCE,y);
-   ObjectSetString(0,name,OBJPROP_TEXT,text);
-   ObjectSetInteger(0,name,OBJPROP_COLOR,clr);
+   ObjectSetInteger(0,name,OBJPROP_XSIZE,w);
+   ObjectSetInteger(0,name,OBJPROP_YSIZE,h);
+   ObjectSetInteger(0,name,OBJPROP_COLOR,border);
+   ObjectSetInteger(0,name,OBJPROP_BGCOLOR,bg);
 }
 
-void PanelRowRight(int index,int y,string text,color clr)
+// A dashed-line section header:  ------- TITLE -------
+string PnSectionText(string title,int width)
 {
-   string name="V13_PanelRowR"+IntegerToString(index);
-   if(ObjectFind(0,name)<0)
+   int inner=width-StringLen(title)-2;
+   if(inner<2) return title;
+   int left=inner/2, right=inner-left;
+   string s="";
+   for(int i=0;i<left;i++)  s+="-";
+   s+=" "+title+" ";
+   for(int i=0;i<right;i++) s+="-";
+   return s;
+}
+
+//-------------------------------------------------------------------------
+//  Row writers. Rows are pooled per column so objects are reused.
+//-------------------------------------------------------------------------
+int PnRowY(int row) { return g_PnBodyTop + row*g_PnRowH; }
+
+void PnLeftRaw(int row,int xOffset,string text,color clr)
+{
+   if(row<0 || row>=PN_MAX_ROWS) return;
+   PnLabel("L"+IntegerToString(row)+"_"+IntegerToString(xOffset),
+           g_PnLeftX+xOffset,PnRowY(row),text,clr,g_PnFont);
+   if(row+1>g_PnLeftUsed) g_PnLeftUsed=row+1;
+}
+
+void PnRightRaw(int row,int xOffset,string text,color clr)
+{
+   if(row<0 || row>=PN_MAX_ROWS) return;
+   PnLabel("R"+IntegerToString(row)+"_"+IntegerToString(xOffset),
+           g_PnRightX+xOffset,PnRowY(row),text,clr,g_PnFont);
+   if(row+1>g_PnRightUsed) g_PnRightUsed=row+1;
+}
+
+// Section header row
+void PnLeftSection(int row,string title)  { PnLeftRaw(row,0,PnSectionText(title,52),clrPnSection); }
+void PnRightSection(int row,string title) { PnRightRaw(row,0,PnSectionText(title,46),clrPnSection); }
+
+// Two key/value pairs side by side on one row (left column only).
+void PnLeftKV2(int row,string l1,string v1,color c1,string l2,string v2,color c2)
+{
+   PnLeftRaw(row,0,PnPad(l1,15)+":",clrPnLabel);
+   PnLabel("LA"+IntegerToString(row),g_PnLeftX+PnTextW(17),PnRowY(row),v1,c1,g_PnFont);
+   if(l2!="")
    {
-      ObjectCreate(0,name,OBJ_LABEL,0,0,0);
-      ObjectSetInteger(0,name,OBJPROP_CORNER,CORNER_LEFT_UPPER);
-      ObjectSetString(0,name,OBJPROP_FONT,"Consolas");
-      ObjectSetInteger(0,name,OBJPROP_FONTSIZE,8);
-      ObjectSetInteger(0,name,OBJPROP_SELECTABLE,false);
-      ObjectSetInteger(0,name,OBJPROP_HIDDEN,true);
+      PnLeftRaw(row,PnTextW(29),PnPad(l2,15)+":",clrPnLabel);
+      PnLabel("LB"+IntegerToString(row),g_PnLeftX+PnTextW(47),PnRowY(row),v2,c2,g_PnFont);
    }
-   ObjectSetInteger(0,name,OBJPROP_ZORDER,5);
-   ObjectSetInteger(0,name,OBJPROP_XDISTANCE,PANEL_X+PANEL_LEFT_W+PANEL_GAP);
-   ObjectSetInteger(0,name,OBJPROP_YDISTANCE,y);
-   ObjectSetString(0,name,OBJPROP_TEXT,text);
-   ObjectSetInteger(0,name,OBJPROP_COLOR,clr);
+   else
+   {
+      PnLeftRaw(row,PnTextW(29),"",clrPnLabel);
+      PnLabel("LB"+IntegerToString(row),g_PnLeftX+PnTextW(47),PnRowY(row),"",clrPnLabel,g_PnFont);
+   }
 }
 
-void ClearPanelObjects()
+void PnRightKV(int row,string label,string value,color vClr)
 {
-   ObjectDelete(0,"V13_PanelBG");
-   ObjectDelete(0,"V13_PanelTitle");
-   ObjectDelete(0,"V13_PanelSep");
-   for(int i=0;i<g_PanelRowPrevCount;i++)
-      ObjectDelete(0,"V13_PanelRow"+IntegerToString(i));
-   for(int i=0;i<g_PanelRightRowPrevCount;i++)
-      ObjectDelete(0,"V13_PanelRowR"+IntegerToString(i));
-   g_PanelRowPrevCount=0;
-   g_PanelRightRowPrevCount=0;
+   PnRightRaw(row,0,PnPad(label,14)+":",clrPnLabel);
+   PnLabel("RV"+IntegerToString(row),g_PnRightX+PnTextW(16),PnRowY(row),value,vClr,g_PnFont);
 }
 
+// Approximate monospace advance width for the configured font size.
+int PnTextW(int chars)
+{
+   double per=g_PnFont*0.62+0.8;     // Consolas ~0.6em advance
+   return (int)MathRound(chars*per);
+}
+
+// Hide (blank) any pooled row that the current frame no longer uses.
+void PnHideSurplus()
+{
+   for(int r=g_PnLeftUsed;r<g_PnLeftPrev && r<PN_MAX_ROWS;r++)
+   {
+      PnLabel("L"+IntegerToString(r)+"_0",g_PnLeftX,PnRowY(r),"",clrPnDim,g_PnFont);
+      PnLabel("LV"+IntegerToString(r),g_PnLeftX,PnRowY(r),"",clrPnDim,g_PnFont);
+      PnLabel("LA"+IntegerToString(r),g_PnLeftX,PnRowY(r),"",clrPnDim,g_PnFont);
+      PnLabel("LB"+IntegerToString(r),g_PnLeftX,PnRowY(r),"",clrPnDim,g_PnFont);
+      PnLabel("L"+IntegerToString(r)+"_"+IntegerToString(PnTextW(29)),g_PnLeftX,PnRowY(r),"",clrPnDim,g_PnFont);
+   }
+   for(int r=g_PnRightUsed;r<g_PnRightPrev && r<PN_MAX_ROWS;r++)
+   {
+      PnLabel("R"+IntegerToString(r)+"_0",g_PnRightX,PnRowY(r),"",clrPnDim,g_PnFont);
+      PnLabel("RV"+IntegerToString(r),g_PnRightX,PnRowY(r),"",clrPnDim,g_PnFont);
+   }
+   // Blank the value labels of the two variable-length right-hand lists.
+   for(int d=g_PnDayCount;d<PN_DAYS;d++)
+      PnLabel("RD"+IntegerToString(d),g_PnRightX,g_PnBodyTop,"",clrPnDim,g_PnFont);
+   for(int t=g_PnTrCount;t<PN_TRADES;t++)
+      PnLabel("RT"+IntegerToString(t),g_PnRightX,g_PnBodyTop,"",clrPnDim,g_PnFont);
+
+   g_PnLeftPrev =g_PnLeftUsed;
+   g_PnRightPrev=g_PnRightUsed;
+}
+
+//-------------------------------------------------------------------------
+//  Live aggregation of THIS EA's open positions (magic + symbol filtered).
+//  Read-only: mirrors what ManageOpenPositions() sees, changes nothing.
+//-------------------------------------------------------------------------
+void PnCollectOpen(int &total,int &buys,int &sells,double &volume,
+                   double &floatPL,double &avgBuy,double &avgSell)
+{
+   total=0; buys=0; sells=0; volume=0; floatPL=0;
+   double buyVolPrice=0, buyVol=0, sellVolPrice=0, sellVol=0;
+   avgBuy=0; avgSell=0;
+
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong t=PositionGetTicket(i); if(t==0) continue;
+      if(!PositionIsMine()) continue;
+      double vol=PositionGetDouble(POSITION_VOLUME);
+      double op =PositionGetDouble(POSITION_PRICE_OPEN);
+      double pl =PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP);
+      total++; volume+=vol; floatPL+=pl;
+      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY)
+      { buys++;  buyVol+=vol;  buyVolPrice+=op*vol; }
+      else
+      { sells++; sellVol+=vol; sellVolPrice+=op*vol; }
+   }
+   if(buyVol>0)  avgBuy =buyVolPrice/buyVol;
+   if(sellVol>0) avgSell=sellVolPrice/sellVol;
+}
+
+//-------------------------------------------------------------------------
+//  Cached history scan: daily P/L series + recent closed trades + today's
+//  win/loss statistics. Filtered strictly by this EA's MagicNumber and
+//  _Symbol, closing deals only (DEAL_ENTRY_OUT), like OnTradeTransaction.
+//-------------------------------------------------------------------------
+void PnRebuildHistory()
+{
+   for(int i=0;i<PN_DAYS;i++)  { g_PnDayUsed[i]=false; g_PnDayPL[i]=0; g_PnDayLabel[i]="--"; }
+   g_PnDayCount=0;
+   g_PnTrCount=0;
+   g_PnTodayWinSum=0; g_PnTodayLossSum=0;
+   g_PnTodayTrades=0; g_PnTodayWins=0; g_PnTodayLosses=0;
+   g_PnConsWins=0;
+
+   datetime now=TimeCurrent();
+   MqlDateTime dt; TimeToStruct(now,dt);
+   dt.hour=0; dt.min=0; dt.sec=0;
+   datetime todayStart=StructToTime(dt);                       // server-day boundary
+   datetime from=todayStart-(datetime)((PN_DAYS-1)*86400);
+
+   if(!HistorySelect(from,now+60)) return;
+
+   int deals=HistoryDealsTotal();
+   // Build the day buckets (index 0 = today, 1 = yesterday, ...).
+   for(int d=0;d<PN_DAYS;d++)
+   {
+      datetime ds=todayStart-(datetime)(d*86400);
+      MqlDateTime dd; TimeToStruct(ds,dd);
+      g_PnDayLabel[d]=(d==0)?"Today":StringFormat("%02d/%02d",dd.mon,dd.day);
+   }
+
+   // Newest-first walk so the recent-trade list and the win streak are easy.
+   bool streakOpen=true;
+   for(int i=deals-1;i>=0;i--)
+   {
+      ulong ticket=HistoryDealGetTicket(i);
+      if(ticket==0) continue;
+      if(HistoryDealGetString(ticket,DEAL_SYMBOL)!=_Symbol) continue;
+      if(HistoryDealGetInteger(ticket,DEAL_MAGIC)!=MagicNumber) continue;
+      if(HistoryDealGetInteger(ticket,DEAL_ENTRY)!=DEAL_ENTRY_OUT) continue;
+
+      double pl = HistoryDealGetDouble(ticket,DEAL_PROFIT)
+                + HistoryDealGetDouble(ticket,DEAL_SWAP)
+                + HistoryDealGetDouble(ticket,DEAL_COMMISSION);
+      datetime tt=(datetime)HistoryDealGetInteger(ticket,DEAL_TIME);
+
+      // Deal direction of the CLOSING deal is inverted vs the position.
+      long dtype=HistoryDealGetInteger(ticket,DEAL_TYPE);
+      string side=(dtype==DEAL_TYPE_SELL)?"Buy":"Sell";
+
+      int dayIdx=(int)((long)(todayStart+86400-1-tt)/86400);
+      if(tt>=todayStart) dayIdx=0;
+      if(dayIdx>=0 && dayIdx<PN_DAYS)
+      {
+         g_PnDayPL[dayIdx]+=pl;
+         g_PnDayUsed[dayIdx]=true;
+      }
+
+      if(tt>=todayStart)
+      {
+         g_PnTodayTrades++;
+         if(pl>0)      { g_PnTodayWins++;   g_PnTodayWinSum+=pl; }
+         else if(pl<0) { g_PnTodayLosses++; g_PnTodayLossSum+=pl; }
+      }
+
+      if(g_PnTrCount<PN_TRADES)
+      {
+         MqlDateTime td; TimeToStruct(tt,td);
+         g_PnTrTime[g_PnTrCount]=StringFormat("%02d/%02d %02d:%02d",td.mon,td.day,td.hour,td.min);
+         g_PnTrType[g_PnTrCount]=side;
+         g_PnTrPL[g_PnTrCount]=pl;
+         g_PnTrCount++;
+      }
+
+      if(streakOpen)
+      {
+         if(pl>0) g_PnConsWins++;
+         else     streakOpen=false;
+      }
+   }
+
+   for(int d=0;d<PN_DAYS;d++)
+      if(g_PnDayUsed[d]) g_PnDayCount++;
+
+   g_PnHistoryLast=now;
+   g_PnHistoryDirty=false;
+}
+
+void PnMaybeRebuildHistory()
+{
+   int every=MathMax(1,PanelHistoryRefreshSec);
+   if(g_PnHistoryDirty || g_PnHistoryLast==0 ||
+      (long)TimeCurrent()-(long)g_PnHistoryLast>=every)
+      PnRebuildHistory();
+}
+
+//-------------------------------------------------------------------------
+//  Status determination (header lamp + left STATUS row).
+//  Reflects the REAL runtime state only - never hardcoded.
+//-------------------------------------------------------------------------
+void PnHeaderStatus(string &txt,color &clr)
+{
+   if(!g_InitComplete)                            { txt="ERROR";      clr=clrPnBad;  return; }
+   if(g_HaltedFloat && CloseAllOnEmergencyLoss)   { txt="EMERGENCY";  clr=clrPnBad;  return; }
+   if(g_HaltedFloat)                              { txt="BLOCKED";    clr=clrPnBad;  return; }
+   if(g_HaltedDaily || g_HaltedConsec)            { txt="BLOCKED";    clr=clrPnBad;  return; }
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED))
+                                                  { txt="DISABLED";   clr=clrPnDim;  return; }
+   if(!UseM1)                                     { txt="DISABLED";   clr=clrPnDim;  return; }
+   if(CountPositions()>0)                         { txt="TRADING";    clr=clrPnGood; return; }
+   if(!InSession() || !SpreadOK() || !VolOK())    { txt="WAITING";    clr=clrPnWarn; return; }
+   if(AlignedBias()==ALIGN_CONFLICT)              { txt="WAITING";    clr=clrPnWarn; return; }
+   if(g_ConsLoss>0)                               { txt="RECOVERING"; clr=clrPnWarn; return; }
+   txt="TRADING"; clr=clrPnGood;
+}
+
+
+//-------------------------------------------------------------------------
+//  Detailed EA status line (same wording/priority as the previous panel).
+//-------------------------------------------------------------------------
 void DetermineStatus(string &status,color &clr)
 {
-   if(g_HaltedDaily)     { status="BLOCKED (daily loss halt)";     clr=clrBad;  return; }
-   if(g_HaltedConsec)    { status="BLOCKED (loss streak halt)";    clr=clrBad;  return; }
-   if(g_HaltedFloat)     { status="BLOCKED (floating loss halt)";  clr=clrBad;  return; }
+   if(!g_InitComplete)   { status="INITIALIZING";                  clr=clrPnDim;  return; }
+   if(g_HaltedDaily)     { status="BLOCKED (daily loss halt)";     clr=clrPnBad;  return; }
+   if(g_HaltedConsec)    { status="BLOCKED (loss streak halt)";    clr=clrPnBad;  return; }
+   if(g_HaltedFloat)     { status="BLOCKED (floating loss halt)";  clr=clrPnBad;  return; }
 
-   // Only when the module is actually active AND the real entry filter
-   // would block a ready setup right now.
    if(g_SRActive)
    {
       string srBlockReason;
       if(SRIsBlockingReadySetup(srBlockReason))
-      { status="TRADE BLOCKED - "+srBlockReason; clr=clrBad; return; }
+      { status="TRADE BLOCKED - "+srBlockReason; clr=clrPnBad; return; }
    }
 
    int open=CountPositions();
    if(open>0)            { status=StringFormat("ACTIVE (managing %d/%d trades)",open,g_MaxOpenTrades);
-                           clr=clrGood; return; }
-   if(!UseM1)            { status="M1 DISABLED (no new setups; managing only)"; clr=clrWarn; return; }
+                           clr=clrPnGood; return; }
+   if(!UseM1)            { status="M1 DISABLED (no new setups; managing only)"; clr=clrPnWarn; return; }
 
    ENUM_ALIGN_RESULT aligned=AlignedBias();
    if(aligned!=ALIGN_CONFLICT)
-                         { status="ACTIVE (scanning "+AlignResultToStr(aligned)+")"; clr=clrGood; return; }
-   status="NO NEW SETUPS (HTF conflict)"; clr=clrWarn;
+                         { status="ACTIVE (scanning "+AlignResultToStr(aligned)+")"; clr=clrPnGood; return; }
+   status="NO NEW SETUPS (HTF conflict)"; clr=clrPnWarn;
 }
 
+// Reuses the existing DetermineStatus() wording for the detailed line.
+string PnDetailStatus(color &clr)
+{
+   string s; color c;
+   DetermineStatus(s,c);
+   clr=c;
+   return s;
+}
+
+//-------------------------------------------------------------------------
+//  Cleanup - removes EVERY object this panel created.
+//-------------------------------------------------------------------------
+void ClearPanelObjects()
+{
+   ObjectsDeleteAll(0,PN_PREFIX);
+   g_PnLeftUsed=0;  g_PnLeftPrev=0;
+   g_PnRightUsed=0; g_PnRightPrev=0;
+}
+
+//-------------------------------------------------------------------------
+//  Latest ACTIVE setup (used by the SETUP STATUS block).
+//-------------------------------------------------------------------------
 int LatestSetupIndex()
 {
    int best=-1; datetime bestT=0;
@@ -2934,163 +3239,417 @@ int LatestSetupIndex()
    return best;
 }
 
+//=========================================================================
+//                          THE DASHBOARD RENDERER
+//=========================================================================
 void RefreshPanel()
 {
    if(!DebugMode) { ClearPanelObjects(); return; }
 
-   g_PanelLineCount=0;
+   // ---- geometry from the configurable inputs ----
+   g_PnX   =MathMax(0,PanelX);
+   g_PnY   =MathMax(0,PanelY);
+   g_PnFont=MathMax(6,MathMin(PanelFontSize,14));
+   g_PnRowH=MathMax(g_PnFont+3,PanelRowHeight);
+   g_PnW   =MathMax(560,PanelWidth);
 
-   string status; color statusClr; DetermineStatus(status,statusClr);
-   PanelAdd("STATUS: "+status,statusClr);
+   int pad=10;
+   g_PnColW  =(g_PnW-pad*3)/2;
+   g_PnLeftX =g_PnX+pad;
+   g_PnSepX  =g_PnX+pad+g_PnColW+pad/2;
+   g_PnRightX=g_PnSepX+pad/2+pad/2;
 
-   ENUM_ALIGN_RESULT aligned=AlignedBias();
-   color alClr=(aligned==ALIGN_BULLISH)?clrBuyC:
-               (aligned==ALIGN_BEARISH)?clrSellC:
-               (aligned==ALIGN_NOFILTER)?clrNormal:clrDim;
-   PanelAdd("ALIGN:  "+AlignResultToStr(aligned),alClr);
+   int headerH=g_PnRowH+10;
+   g_PnBodyTop=g_PnY+headerH+6;
 
-   color h1C =(!UseH1) ?clrDim:((g_H1.bias==BIAS_BULLISH)?clrBuyC:(g_H1.bias==BIAS_BEARISH?clrSellC:clrDim));
-   color m15C=(!UseM15)?clrDim:((g_M15.bias==BIAS_BULLISH)?clrBuyC:(g_M15.bias==BIAS_BEARISH?clrSellC:clrDim));
-   color m5C =(!UseM5) ?clrDim:((g_M5.bias==BIAS_BULLISH)?clrBuyC:(g_M5.bias==BIAS_BEARISH?clrSellC:clrDim));
+   PnMaybeRebuildHistory();
 
-   PanelAdd(StringFormat("H1:   %-3s  %-4s %s%s%s%s",UseH1?"ON":"OFF",UseH1?BiasToStr(g_H1.bias):"-",
-             (UseH1&&g_H1.HH)?"HH ":"",(UseH1&&g_H1.HL)?"HL ":"",(UseH1&&g_H1.LH)?"LH ":"",(UseH1&&g_H1.LL)?"LL":""),h1C);
-   PanelAdd(StringFormat("M15:  %-3s  %-4s %s%s%s%s",UseM15?"ON":"OFF",UseM15?BiasToStr(g_M15.bias):"-",
-             (UseM15&&g_M15.HH)?"HH ":"",(UseM15&&g_M15.HL)?"HL ":"",(UseM15&&g_M15.LH)?"LH ":"",(UseM15&&g_M15.LL)?"LL":""),m15C);
-   PanelAdd(StringFormat("M5:   %-3s  %-4s %s%s%s%s",UseM5?"ON":"OFF",UseM5?BiasToStr(g_M5.bias):"-",
-             (UseM5&&g_M5.HH)?"HH ":"",(UseM5&&g_M5.HL)?"HL ":"",(UseM5&&g_M5.LH)?"LH ":"",(UseM5&&g_M5.LL)?"LL":""),m5C);
-   PanelAdd(StringFormat("M1:   %-3s  %s",UseM1?"ON":"OFF",UseM1?"(setup engine active)":"(setups disabled)"),
-            UseM1?clrGood:clrDim);
+   g_PnLeftUsed=0; g_PnRightUsed=0;
 
-   PanelAdd("--------------------------------------",clrPanelBorder);
+   //=====================  LIVE DATA SNAPSHOT  ==========================
+   double bal   =AccountInfoDouble(ACCOUNT_BALANCE);
+   double eq    =AccountInfoDouble(ACCOUNT_EQUITY);
+   double freeM =AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   double usedM =AccountInfoDouble(ACCOUNT_MARGIN);
+   double mlevel=AccountInfoDouble(ACCOUNT_MARGIN_LEVEL);
+   long   lev   =AccountInfoInteger(ACCOUNT_LEVERAGE);
 
-   PanelAdd(StringFormat("M1 SETUPS:  Active %d  Ready %d",CountActiveSetups(),CountReadySetups()),clrNormal);
+   int    oTotal,oBuys,oSells; double oVol,oFloat,oAvgBuy,oAvgSell;
+   PnCollectOpen(oTotal,oBuys,oSells,oVol,oFloat,oAvgBuy,oAvgSell);
 
-   int li=LatestSetupIndex();
-   if(li>=0)
+   int spreadPts=(int)SymbolInfoInteger(_Symbol,SYMBOL_SPREAD);
+
+   //=========================  HEADER  ==================================
+   string stTxt; color stClr; PnHeaderStatus(stTxt,stClr);
+
+   int totalRows=0;   // computed after the columns are built
+   // (the background is sized at the end - create it first at z-order 0)
+
+   PnLabel("HdrName",g_PnLeftX,g_PnY+5,
+           "XAUUSD_TrendContinuation_V13 | v13.4",clrPnTitle,g_PnFont+2);
+   PnLabel("HdrSym",g_PnX+g_PnW/2,g_PnY+5,
+           _Symbol+"  "+PnTFName(_Period),clrPnValue,g_PnFont+2);
+   PnLabel("HdrStat",g_PnX+g_PnW-PnTextW(14),g_PnY+5,stTxt+"  *",stClr,g_PnFont+2);
+
+   //=======================  LEFT COLUMN  ===============================
+   int r=0;
+
+   // ---- A. ACCOUNT & RISK ----
+   PnLeftSection(r++,"ACCOUNT & RISK");
+   PnLeftKV2(r++,"Balance",   StringFormat("%.2f USD",bal), clrPnValue,
+                 "Profit Target", StringFormat("%.2f USD",g_ProfitTargetUSD), clrPnGood);
+   PnLeftKV2(r++,"Equity",    StringFormat("%.2f USD",eq),  clrPnValue,
+                 "Max Trades",StringFormat("%d",g_MaxOpenTrades), clrPnValue);
+   PnLeftKV2(r++,"Floating P/L", StringFormat("%+.2f USD",oFloat), PnPLColor(oFloat),
+                 "Lot Size",  StringFormat("%.2f",g_LotSize), clrPnValue);
+   PnLeftKV2(r++,"Free Margin",  StringFormat("%.2f USD",freeM), clrPnValue,
+                 "Spread",    StringFormat("%d / %d pts",spreadPts,g_MaxSpreadPoints),
+                 (SpreadOK()?clrPnGood:clrPnBad));
+   PnLeftKV2(r++,"Margin Level", (usedM>0?StringFormat("%.1f %%",mlevel):"--"),
+                 (usedM>0 && mlevel<200 ? clrPnWarn : clrPnValue),
+                 "Leverage",  StringFormat("1:%d",(int)lev), clrPnValue);
+   r++;
+
+   // ---- B. TRADE SAFETY ----
+   PnLeftSection(r++,"TRADE SAFETY");
+   double curLoss=(oFloat<0)?-oFloat:0.0;
+   PnLeftKV2(r++,"Max Float Loss", StringFormat("%.2f USD",g_MaxFloatingLossUSD), clrPnValue,
+                 "Current Loss",   StringFormat("%.2f USD",curLoss),
+                 (curLoss>0?clrPnBad:clrPnGood));
+   PnLeftKV2(r++,"Close All Emerg",(CloseAllOnEmergencyLoss?"YES":"NO"),
+                 (CloseAllOnEmergencyLoss?clrPnGood:clrPnWarn),
+                 "Daily Loss Lim", (g_DailyLossLimitPercent>0?
+                     StringFormat("%.2f %%",g_DailyLossLimitPercent):"OFF"), clrPnValue);
+   PnLeftKV2(r++,"Consec Loss Lim",(g_ConsecutiveLossLimit>0?
+                     StringFormat("%d",g_ConsecutiveLossLimit):"OFF"), clrPnValue,
+                 "Consec Losses",  StringFormat("%d",g_ConsLoss),
+                 (g_ConsLoss>0?clrPnWarn:clrPnGood));
+   string permTxt; color permClr;
    {
-      M1Setup s=g_Setups[li];
-      color sClr=(s.direction==BIAS_BULLISH)?clrBuyC:clrSellC;
-      PanelAdd(StringFormat("LATEST SETUP #%d  %s",(int)s.id,BiasToStr(s.direction)),sClr);
-      PanelAdd(StringFormat("A:%s  B:%s  C:%s  TRIG:%s   (%s)",
-                  (s.At>0?"OK":"-"),(s.Bt>0?"OK":"-"),(s.Ct>0?"OK":"-"),
-                  (s.triggerTime>0?"OK":"-"),SetupStateToStr(s.state)),clrNormal);
-      if(s.state==MS_WAIT_BREAK)
-      {
-         string bo=(s.entryStatus==""||s.entryStatus=="WAITING")?"WAITING":s.entryStatus;
-         PanelAdd("BREAKOUT: "+bo+"   QUALITY: "+s.breakoutQuality,clrWarn);
-         if(s.entryStatus=="BLOCKED" && s.blockReason!="")
-            PanelAdd("Reason: "+Trunc(s.blockReason,36),clrBad);
-      }
+      string why;
+      // Read-only permission probe using the direction the EA would take.
+      ENUM_ALIGN_RESULT al=AlignedBias();
+      ENUM_BIAS probe=(al==ALIGN_BEARISH)?BIAS_BEARISH:BIAS_BULLISH;
+      if(CheckEntryPermissions(probe,why)) { permTxt="ALLOWED"; permClr=clrPnGood; }
+      else                                  { permTxt=Trunc(why,22); permClr=clrPnBad; }
    }
-   else
-      PanelAdd("LATEST SETUP: none",clrDim);
+   PnLeftKV2(r++,"Daily Status", (g_HaltedDaily?"HALTED":"NORMAL"),
+                 (g_HaltedDaily?clrPnBad:clrPnGood),
+                 "Trade Permit", permTxt, permClr);
+   r++;
 
-   PanelAdd("--------------------------------------",clrPanelBorder);
-
-   PanelAdd(StringFormat("OPEN: %d / %d     FLOAT: %+.2f",CountPositions(),g_MaxOpenTrades,g_TotalFloat),
-            (g_TotalFloat>=0?clrGood:clrBad));
-   PanelAdd(StringFormat("TARGET: +$%.2f/pos   MAXFLOAT: -$%.2f",g_ProfitTargetUSD,g_MaxFloatingLossUSD),clrNormal);
-   PanelAdd(StringFormat("TODAY: %+.2f      TOTAL: %+.2f",g_DayPL,g_TotalRealizedPL),
-            ((g_DayPL+g_TotalRealizedPL)>=0?clrGood:clrBad));
-
-   double winRate=(g_Wins+g_Losses>0)?(100.0*g_Wins/(g_Wins+g_Losses)):0.0;
-   PanelAdd(StringFormat("W/L: %d/%d  WR %.0f%%  StreakL:%d  @$target:%d",
-            g_Wins,g_Losses,winRate,g_ConsLoss,g_Cnt_TargetCloses),clrNormal);
-
-   PanelAdd(StringFormat("SPREAD: %d pts   ATR(M1): %.2f   SES:%s VOL:%s",
-            (int)SymbolInfoInteger(_Symbol,SYMBOL_SPREAD),AtrVal(g_ATR_M1,1),
-            (InSession()?"OK":"OFF"),(VolOK()?"OK":"SPIKE")),clrNormal);
-
-   PanelAdd("--------------------------------------",clrPanelBorder);
-
-   int shown=0;
-   for(int i=PositionsTotal()-1;i>=0 && shown<4;i--)
+   // ---- C. MULTI-TIMEFRAME BIAS ----
+   PnLeftSection(r++,"MULTI-TIMEFRAME BIAS");
    {
-      ulong t=PositionGetTicket(i); if(t==0) continue;
-      if(!PositionIsMine()) continue;
-      ENUM_POSITION_TYPE pt=(ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-      double profit=PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP);
-      long sid=ParseSetupIdFromComment(PositionGetString(POSITION_COMMENT));
-      string d=(pt==POSITION_TYPE_BUY)?"BUY":"SELL";
-      color dClr=(pt==POSITION_TYPE_BUY)?clrBuyC:clrSellC;
-      PanelAdd(StringFormat("TRADE #%d  %s  P/L %+.2f / +$%.2f",(int)sid,d,profit,g_ProfitTargetUSD),
-               (profit>=0?dClr:clrBad));
-      shown++;
+      color h1C =(!UseH1) ?clrPnDim:((g_H1.bias==BIAS_BULLISH)?clrPnGood:(g_H1.bias==BIAS_BEARISH?clrPnBad:clrPnDim));
+      color m15C=(!UseM15)?clrPnDim:((g_M15.bias==BIAS_BULLISH)?clrPnGood:(g_M15.bias==BIAS_BEARISH?clrPnBad:clrPnDim));
+      color m5C =(!UseM5) ?clrPnDim:((g_M5.bias==BIAS_BULLISH)?clrPnGood:(g_M5.bias==BIAS_BEARISH?clrPnBad:clrPnDim));
+
+      string h1V =UseH1 ?(g_H1.bias==BIAS_BULLISH?"BULLISH":(g_H1.bias==BIAS_BEARISH?"BEARISH":"NEUTRAL")):"OFF";
+      string m15V=UseM15?(g_M15.bias==BIAS_BULLISH?"BULLISH":(g_M15.bias==BIAS_BEARISH?"BEARISH":"NEUTRAL")):"OFF";
+      string m5V =UseM5 ?(g_M5.bias==BIAS_BULLISH?"BULLISH":(g_M5.bias==BIAS_BEARISH?"BEARISH":"NEUTRAL")):"OFF";
+
+      ENUM_ALIGN_RESULT al=AlignedBias();
+      string alV=(al==ALIGN_BULLISH)?"BULLISH":
+                 (al==ALIGN_BEARISH)?"BEARISH":
+                 (al==ALIGN_NOFILTER)?"NO FILTER":"CONFLICT";
+      color  alC=(al==ALIGN_BULLISH)?clrPnGood:(al==ALIGN_BEARISH)?clrPnBad:
+                 (al==ALIGN_NOFILTER)?clrPnValue:clrPnWarn;
+
+      string m1V =UseM1?alV:"OFF";
+      color  m1C =UseM1?alC:clrPnDim;
+
+      PnLeftKV2(r++,"H1  Big Direct", h1V, h1C,  "Aligned Bias", alV, alC);
+      PnLeftKV2(r++,"M15 Structure",  m15V,m15C, "", "", clrPnDim);
+      PnLeftKV2(r++,"M5  Regime",     m5V, m5C,  "", "", clrPnDim);
+      PnLeftKV2(r++,"M1  Entry",      m1V, m1C,  "", "", clrPnDim);
    }
-   if(shown==0) PanelAdd("TRADE: NONE",clrDim);
+   r++;
 
-   PanelAdd("--------------------------------------",clrPanelBorder);
-   PanelAdd("LAST: "+Trunc(g_LastAction,44),clrWarn);
-
-   // ---- RIGHT column: M30 S/R info (OFF-safe) ----
-   g_PanelRightLineCount=0;
-
+   // ---- D. M30 SUPPORT/RESISTANCE FILTER ----
+   PnLeftSection(r++,"M30 S/R FILTER");
    if(!g_SRActive)
    {
-      PanelRightAdd("M30: OFF",clrDim);
-      PanelRightAdd("Nearest R: -",clrDim);
-      PanelRightAdd("Nearest S: -",clrDim);
-      PanelRightAdd("Zones: -",clrDim);
-      PanelRightAdd("Updated: -",clrDim);
-      PanelRightAdd("--------------------",clrPanelBorder);
-      PanelRightAdd("M1 Filter: OFF",clrDim);
+      // Module genuinely off: no S/R computation is performed for display.
+      PnLeftKV2(r++,"Status","DISABLED",clrPnDim,"Entry Filter","N/A",clrPnDim);
+      PnLeftKV2(r++,"Nearest Zone","--",clrPnDim,"Confirmation","--",clrPnDim);
    }
    else
    {
-      color srStateClr=clrNormal;
-      switch(g_SRState)
+      MqlTick tkp; bool haveTick=SymbolInfoTick(_Symbol,tkp);
+      double pt=SymbolInfoDouble(_Symbol,SYMBOL_POINT);
+      string zoneTxt="--", dirTxt="--";
+      color  dirClr=clrPnDim;
+
+      double nearestPrice=0; bool nearestIsRes=false; double bestDist=DBL_MAX;
+      for(int i=0;i<g_SRZoneCount && i<SR_MAX_ZONES;i++)
       {
-         case SR_NEAR_RESISTANCE:
-         case SR_BREAKING_RESISTANCE: srStateClr=clrSellC; break;
-         case SR_NEAR_SUPPORT:
-         case SR_BREAKING_SUPPORT:    srStateClr=clrBuyC;  break;
-         case SR_NO_VALID:
-         case SR_DISABLED:            srStateClr=clrDim;   break;
-         default:                     srStateClr=clrNormal;
+         if(!g_SRZones[i].valid) continue;
+         double p=haveTick?(g_SRZones[i].isResistance?tkp.ask:tkp.bid):0;
+         if(p<=0) continue;
+         double d;
+         if(p>g_SRZones[i].upper)      d=p-g_SRZones[i].upper;
+         else if(p<g_SRZones[i].lower) d=g_SRZones[i].lower-p;
+         else                          d=0;
+         if(d<bestDist)
+         { bestDist=d; nearestPrice=(g_SRZones[i].upper+g_SRZones[i].lower)/2.0;
+           nearestIsRes=g_SRZones[i].isResistance; }
+      }
+      if(nearestPrice>0 && pt>0)
+      {
+         zoneTxt=StringFormat("%.1f pts",bestDist/pt);
+         dirTxt =nearestIsRes?"RESISTANCE":"SUPPORT";
+         dirClr =nearestIsRes?clrPnBad:clrPnGood;
       }
 
-      PanelRightAdd("M30: "+SRStateToStr(g_SRState),srStateClr);
-      PanelRightAdd("Nearest R: "+(g_SRNearestResistance>0?DoubleToString(g_SRNearestResistance,2):"-"),clrNormal);
-      PanelRightAdd("Nearest S: "+(g_SRNearestSupport>0?DoubleToString(g_SRNearestSupport,2):"-"),clrNormal);
-      PanelRightAdd(StringFormat("Zones: %d/%d",g_SRZoneCount,SR_MAX_ZONES),clrNormal);
-      PanelRightAdd("Updated: "+(g_SRLastUpdate>0?TimeToString(g_SRLastUpdate,TIME_MINUTES):"-"),clrDim);
-      PanelRightAdd("--------------------",clrPanelBorder);
+      // Highest live confirmation progress among the valid zones.
+      int confNow=0;
+      for(int i=0;i<g_SRZoneCount && i<SR_MAX_ZONES;i++)
+         if(g_SRZones[i].valid && g_SRZones[i].breakCount>confNow) confNow=g_SRZones[i].breakCount;
 
-      string srBlockReason2;
-      if(SRIsBlockingReadySetup(srBlockReason2))
-         PanelRightAdd("M1 Filter: Blocked - "+Trunc(srBlockReason2,18),clrBad);
+      // Entry-filter verdict from THE SAME function the entry logic uses.
+      string srWhy; bool srBlocked=SRIsBlockingReadySetup(srWhy);
+      if(!srBlocked)
+      {
+         // No ready setup? Show the verdict for the currently aligned side.
+         ENUM_ALIGN_RESULT al=AlignedBias();
+         ENUM_BIAS probe=(al==ALIGN_BEARISH)?BIAS_BEARISH:BIAS_BULLISH;
+         srBlocked=SRBlockReasonForDirection(probe,srWhy);
+      }
+
+      PnLeftKV2(r++,"Status",SRStateToStr(g_SRState),
+                    (g_SRState==SR_NO_VALID?clrPnDim:clrPnValue),
+                    "Entry Filter",(srBlocked?"BLOCKED":"ALLOWED"),
+                    (srBlocked?clrPnBad:clrPnGood));
+      PnLeftKV2(r++,"Nearest Zone",zoneTxt,clrPnValue,
+                    "Direction",dirTxt,dirClr);
+      PnLeftKV2(r++,"Confirmation",StringFormat("%d / %d",confNow,g_SRBreakConfirmBars),
+                    (confNow>0?clrPnWarn:clrPnValue),
+                    "Zones",StringFormat("%d / %d",g_SRZoneCount,SR_MAX_ZONES),clrPnValue);
+      if(srBlocked && srWhy!="")
+         PnLeftKV2(r++,"Block Reason",Trunc(srWhy,24),clrPnBad,"","",clrPnDim);
+   }
+   r++;
+
+   // ---- E. OPEN TRADES ----
+   PnLeftSection(r++,"OPEN TRADES");
+   PnLeftKV2(r++,"Total Trades",StringFormat("%d / %d",oTotal,g_MaxOpenTrades),
+                 (oTotal>0?clrPnGood:clrPnValue),
+                 "Total Volume",StringFormat("%.2f",oVol),clrPnValue);
+   PnLeftKV2(r++,"Buy Trades",StringFormat("%d",oBuys),(oBuys>0?clrPnGood:clrPnValue),
+                 "Avg Buy",(oAvgBuy>0?DoubleToString(oAvgBuy,_Digits):"--"),clrPnValue);
+   PnLeftKV2(r++,"Sell Trades",StringFormat("%d",oSells),(oSells>0?clrPnBad:clrPnValue),
+                 "Avg Sell",(oAvgSell>0?DoubleToString(oAvgSell,_Digits):"--"),clrPnValue);
+   PnLeftKV2(r++,"Floating P/L",StringFormat("%+.2f USD",oFloat),PnPLColor(oFloat),
+                 "Target/Pos",StringFormat("+%.2f USD",g_ProfitTargetUSD),clrPnGood);
+   r++;
+
+   // ---- F. SETUP STATUS ----
+   PnLeftSection(r++,"SETUP STATUS");
+   {
+      int li=LatestSetupIndex();
+      if(li<0)
+      {
+         PnLeftKV2(r++,"Current Setup",(UseM1?"NONE":"M1 DISABLED"),
+                       (UseM1?clrPnDim:clrPnWarn),
+                       "Active / Ready",StringFormat("%d / %d",CountActiveSetups(),CountReadySetups()),
+                       clrPnValue);
+         PnLeftKV2(r++,"Breakout","--",clrPnDim,"Permission","--",clrPnDim);
+      }
       else
-         PanelRightAdd("M1 Filter: OK",clrGood);
+      {
+         M1Setup s=g_Setups[li];
+         string stage=(s.state==MS_WAIT_B)?"A":(s.state==MS_WAIT_C)?"B":
+                      (s.state==MS_WAIT_TRIGGER)?"C":"TRIGGER";
+         string dirS =(s.direction==BIAS_BULLISH)?"BUY":"SELL";
+         color  dirC =(s.direction==BIAS_BULLISH)?clrPnGood:clrPnBad;
+
+         string boTxt=(s.state==MS_WAIT_BREAK)
+                      ? ((s.entryStatus==""||s.entryStatus=="WAITING")?"ARMED":s.entryStatus)
+                      : "PENDING";
+         color  boClr=(s.state==MS_WAIT_BREAK)?clrPnWarn:clrPnDim;
+         if(s.entryStatus=="EXECUTED") boClr=clrPnGood;
+         if(s.entryStatus=="BLOCKED" || s.entryStatus=="FAILED") boClr=clrPnBad;
+
+         // Entry window = whole bars left before the age expiry retires it.
+         string winTxt="--";
+         if(g_SetupExpiryMinutes>0)
+         {
+            long leftSec=(long)g_SetupExpiryMinutes*60-((long)TimeCurrent()-(long)s.createdTime);
+            if(leftSec<0) leftSec=0;
+            winTxt=StringFormat("%d bars",(int)(leftSec/60));
+         }
+
+         string permTxt2; color permClr2;
+         {
+            string why2;
+            if(CheckEntryPermissions(s.direction,why2)) { permTxt2="ALLOWED"; permClr2=clrPnGood; }
+            else                                         { permTxt2=Trunc(why2,20); permClr2=clrPnBad; }
+         }
+
+         PnLeftKV2(r++,"Current Setup",StringFormat("#%d %s (%s)",(int)s.id,stage,dirS),dirC,
+                       "Active / Ready",StringFormat("%d / %d",CountActiveSetups(),CountReadySetups()),
+                       clrPnValue);
+         PnLeftKV2(r++,"Breakout",boTxt,boClr,
+                       "Quality",s.breakoutQuality,
+                       (s.breakoutQuality=="PASS"?clrPnGood:
+                        s.breakoutQuality=="WEAK"?clrPnWarn:clrPnDim));
+         PnLeftKV2(r++,"Pullback",(s.pullbackDistance>0?DoubleToString(s.pullbackDistance,2):"--"),
+                       clrPnValue,
+                       "Entry Window",winTxt,clrPnValue);
+         PnLeftKV2(r++,"Validity",(s.active?"VALID":"RETIRED"),(s.active?clrPnGood:clrPnDim),
+                       "Permission",permTxt2,permClr2);
+         if(s.entryStatus=="BLOCKED" && s.blockReason!="")
+            PnLeftKV2(r++,"Block Reason",Trunc(s.blockReason,24),clrPnBad,"","",clrPnDim);
+      }
    }
+   r++;
 
-   int totalHeight=20+(MathMax(g_PanelLineCount,g_PanelRightLineCount)*PANEL_ROWH)+10;
-   if(totalHeight<180) totalHeight=180;
-   EnsurePanelBackground(totalHeight);
-   EnsureSeparator(totalHeight);
-
-   EnsureTitle();
-   int y=PANEL_Y+20;
-   for(int i=0;i<g_PanelLineCount;i++)
+   // ---- G. TODAY'S REPORT ----
+   PnLeftSection(r++,"TODAY'S REPORT");
    {
-      PanelRow(i,y,g_PanelLines[i],g_PanelColors[i]);
-      y+=PANEL_ROWH;
-   }
-   for(int i=g_PanelLineCount;i<g_PanelRowPrevCount;i++)
-      ObjectDelete(0,"V13_PanelRow"+IntegerToString(i));
-   g_PanelRowPrevCount=g_PanelLineCount;
+      double todayNet=g_PnTodayWinSum+g_PnTodayLossSum;
+      double wr=(g_PnTodayWins+g_PnTodayLosses>0)
+                ? 100.0*g_PnTodayWins/(g_PnTodayWins+g_PnTodayLosses) : 0.0;
 
-   int yr=PANEL_Y+20;
-   for(int i=0;i<g_PanelRightLineCount;i++)
+      // Intraday equity drawdown (display-only tracking, see OnTick hook).
+      string ddTxt=(g_PnDayPeakEquity>0)?StringFormat("%.2f %%",g_PnDayDDPct):"--";
+
+      PnLeftKV2(r++,"Trades",StringFormat("%d",g_PnTodayTrades),clrPnValue,
+                    "Max Drawdown",ddTxt,(g_PnDayDDPct>0?clrPnWarn:clrPnValue));
+      PnLeftKV2(r++,"Win Rate",
+                    (g_PnTodayWins+g_PnTodayLosses>0?StringFormat("%.2f %%",wr):"--"),
+                    (wr>=50?clrPnGood:clrPnWarn),
+                    "Daily P/L",StringFormat("%+.2f USD",todayNet),PnPLColor(todayNet));
+      PnLeftKV2(r++,"Total Profit",StringFormat("%.2f USD",g_PnTodayWinSum),clrPnGood,
+                    "Total Loss",StringFormat("%.2f USD",g_PnTodayLossSum),
+                    (g_PnTodayLossSum<0?clrPnBad:clrPnValue));
+      PnLeftKV2(r++,"Consec Wins",StringFormat("%d",g_PnConsWins),
+                    (g_PnConsWins>0?clrPnGood:clrPnValue),
+                    "Consec Losses",StringFormat("%d",g_ConsLoss),
+                    (g_ConsLoss>0?clrPnBad:clrPnValue));
+      color dsClr; string dsTxt=PnDetailStatus(dsClr);
+      color mapped=(dsClr==clrPnBad)?clrPnBad:dsClr;
+      PnLeftKV2(r++,"EA Status",Trunc(dsTxt,38),mapped,"","",clrPnDim);
+   }
+
+   //=======================  RIGHT COLUMN  ==============================
+   int rr=0;
+
+   // ---- A. MAX FLOATING LOSS ----
+   PnRightSection(rr++,"MAX FLOATING LOSS");
    {
-      PanelRowRight(i,yr,g_PanelRightLines[i],g_PanelRightColors[i]);
-      yr+=PANEL_ROWH;
-   }
-   for(int i=g_PanelRightLineCount;i<g_PanelRightRowPrevCount;i++)
-      ObjectDelete(0,"V13_PanelRowR"+IntegerToString(i));
-   g_PanelRightRowPrevCount=g_PanelRightLineCount;
+      double lim=g_MaxFloatingLossUSD;
+      double cur=(oFloat<0)?-oFloat:0.0;
+      string curTxt,limTxt; color curClr;
+      if(oFloat>=0)
+      {
+         curTxt=StringFormat("%.2f USD  (0.00%%)",0.0);
+         curClr=clrPnGood;
+      }
+      else
+      {
+         curTxt=StringFormat("%.2f USD  %s",cur,PnPct(cur,lim));
+         double ratio=(lim>0)?cur/lim:0;
+         curClr=(ratio>=0.75)?clrPnBad:(ratio>=0.4)?clrPnWarn:clrPnValue;
+      }
+      limTxt=(lim>0)?StringFormat("%.2f USD  (100.00%%)",lim):"DISABLED";
 
+      string emTxt; color emClr;
+      if(g_HaltedFloat)                   { emTxt="TRIGGERED"; emClr=clrPnBad; }
+      else if(lim<=0)                     { emTxt="OFF";       emClr=clrPnDim; }
+      else if(cur>=lim*0.75)              { emTxt="WARNING";   emClr=clrPnWarn; }
+      else                                { emTxt="NORMAL";    emClr=clrPnGood; }
+
+      PnRightKV(rr++,"Current",curTxt,curClr);
+      PnRightKV(rr++,"Limit",limTxt,clrPnValue);
+      PnRightKV(rr++,"Float P/L",StringFormat("%+.2f USD",oFloat),PnPLColor(oFloat));
+      PnRightKV(rr++,"Status",emTxt,emClr);
+      PnRightKV(rr++,"Close All",(CloseAllOnEmergencyLoss?"ENABLED":"DISABLED"),
+                (CloseAllOnEmergencyLoss?clrPnGood:clrPnWarn));
+   }
+   rr++;
+
+   // ---- B. DAILY PROFIT HISTORY ----
+   PnRightSection(rr++,"DAILY PROFIT");
+   if(g_PnDayCount<=0)
+      PnRightRaw(rr++,0,"  No historical data",clrPnDim);
+   else
+   {
+      for(int d=0;d<PN_DAYS;d++)
+      {
+         if(!g_PnDayUsed[d]) continue;
+         double v=g_PnDayPL[d];
+         string pctTxt=(bal-v!=0.0)?StringFormat("(%.2f%%)",100.0*v/MathMax(0.01,bal-v)):"";
+         PnRightRaw(rr,0,PnPad(g_PnDayLabel[d],8),clrPnLabel);
+         PnLabel("RD"+IntegerToString(d),g_PnRightX+PnTextW(9),PnRowY(rr),
+                 StringFormat("%+8.2f USD  %s",v,pctTxt),PnPLColor(v),g_PnFont);
+         rr++;
+      }
+   }
+   rr++;
+
+   // ---- C. RECENT TRADES ----
+   PnRightSection(rr++,"RECENT TRADES");
+   PnRightRaw(rr++,0,PnPad("Time",13)+PnPad("Type",6)+PnPad("Result",8)+"P/L",clrPnDim);
+   if(g_PnTrCount<=0)
+      PnRightRaw(rr++,0,"  No closed trades yet",clrPnDim);
+   else
+   {
+      for(int t=0;t<g_PnTrCount;t++)
+      {
+         bool win=(g_PnTrPL[t]>=0);
+         PnRightRaw(rr,0,PnPad(g_PnTrTime[t],13)+PnPad(g_PnTrType[t],6),clrPnValue);
+         PnLabel("RT"+IntegerToString(t),g_PnRightX+PnTextW(19),PnRowY(rr),
+                 PnPad(win?"WIN":"LOSS",8)+StringFormat("%+.2f",g_PnTrPL[t]),
+                 (win?clrPnGood:clrPnBad),g_PnFont);
+         rr++;
+      }
+   }
+
+   //=========================  SIZE + CHROME  ===========================
+   totalRows=MathMax(g_PnLeftUsed,g_PnRightUsed);
+   int bodyH =totalRows*g_PnRowH;
+   int footerH=g_PnRowH+8;
+   g_PnH=(g_PnBodyTop-g_PnY)+bodyH+footerH+8;
+   if(PanelMinHeight>0 && g_PnH<PanelMinHeight) g_PnH=PanelMinHeight;
+
+   PnRect("BG",g_PnX,g_PnY,g_PnW,g_PnH,clrPnBorder,clrPnBG,0);
+   PnRect("HdrLine",g_PnX+4,g_PnY+headerH,g_PnW-8,1,clrPnBorder,clrPnBorder,2);
+   PnRect("Sep",g_PnSepX,g_PnBodyTop-2,1,bodyH+4,clrPnSep,clrPnSep,2);
+   g_PnFooterY=g_PnY+g_PnH-footerH;
+   PnRect("FtLine",g_PnX+4,g_PnFooterY,g_PnW-8,1,clrPnBorder,clrPnBorder,2);
+
+   //============================  FOOTER  ===============================
+   {
+      datetime lt=TimeLocal(), st=TimeCurrent();
+      string nextAction;
+      // M1 setup-check progress = seconds elapsed inside the current M1 bar.
+      datetime m1open=iTime(_Symbol,PERIOD_M1,0);
+      int secIn=(m1open>0)?(int)((long)st-(long)m1open):0;
+      if(secIn<0) secIn=0; if(secIn>59) secIn=59;
+      nextAction=StringFormat("Next: M1 Setup Check (%d/60s)",secIn);
+
+      bool connected=(bool)TerminalInfoInteger(TERMINAL_CONNECTED);
+      string conn=connected?"CONNECTED":"NO CONNECTION";
+      color  connClr=connected?clrPnGood:clrPnBad;
+
+      int fy=g_PnFooterY+5;
+      PnLabel("Ft1",g_PnLeftX,fy,TimeToString(lt,TIME_DATE|TIME_SECONDS),clrPnValue,g_PnFont);
+      PnLabel("Ft2",g_PnLeftX+PnTextW(22),fy,"| "+nextAction,clrPnWarn,g_PnFont);
+      PnLabel("Ft3",g_PnLeftX+PnTextW(52),fy,
+              "| Server: "+TimeToString(st,TIME_SECONDS),clrPnValue,g_PnFont);
+      PnLabel("Ft4",g_PnLeftX+PnTextW(72),fy,
+              "| "+AccountInfoString(ACCOUNT_SERVER),clrPnLabel,g_PnFont);
+      PnLabel("Ft5",g_PnLeftX+PnTextW(95),fy,"| "+conn,connClr,g_PnFont);
+   }
+
+   PnHideSurplus();
+
+   // Existing chart annotations are unchanged.
    DrawHTFVisuals();
    DrawAllSetupVisuals();
+
+   ChartRedraw(0);
 }
 //+------------------------------------------------------------------+
